@@ -415,12 +415,11 @@ int64_t cbm_neo4j_val_int(yyjson_val *v, int64_t fallback) {
 
 char *cbm_neo4j_val_strdup(yyjson_val *v, const char *fallback) {
     const char *s = NULL;
-    char *owned = NULL;
     if (yyjson_is_str(v)) {
         s = yyjson_get_str(v);
     } else if (v && !yyjson_is_null(v)) {
-        owned = yyjson_val_write(v, 0, NULL);
-        return owned;
+        /* Non-string values (numbers, lists, maps) come back as their JSON. */
+        return yyjson_val_write(v, 0, NULL);
     } else {
         s = fallback;
     }
