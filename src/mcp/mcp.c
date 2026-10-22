@@ -65,6 +65,9 @@ enum {
 #include <sqlite3.h>
 #include "cypher/cypher.h"
 #include "discover/discover.h"
+#include "neo4j/neo4j_client.h"
+#include "neo4j/neo4j_store.h"
+#include "neo4j/neo4j_sync.h"
 #include "pipeline/pipeline.h"
 #include "callable_sig.h"       /* cbm_qn_callable_base_len */
 #include "pipeline/doc_links.h" /* cbm_doclink_reason_name: the reasons the layer writes */
@@ -559,7 +562,11 @@ static const tool_def_t TOOLS[] = {
      "one-shot cli call that is the only client of a temporary daemon (run daemon start).\"},"
      "\"status\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Report the running or last index job (queued/running/succeeded/failed/cancelled) "
-     "instead of indexing. Pass the same repo_path (and name, if any) as the index call.\"}"
+     "instead of indexing. Pass the same repo_path (and name, if any) as the index call.\"},"
+     "\"graph_db\":{\"type\":\"string\",\"description\":"
+     "\"Neo4j URL http://host:7474; graph tools read it. sqlite reverts.\"},"
+     "\"graph_user\":{\"type\":\"string\"},\"graph_password\":{\"type\":\"string\"},"
+     "\"graph_database\":{\"type\":\"string\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph",
@@ -599,6 +606,8 @@ static const tool_def_t TOOLS[] = {
      "query\"},\"project\":{\"type\":\"string\"},"
      "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"missed\"],\"default\":\"code\","
      "\"description\":\"code graph (default) or missed coverage-gap file tree.\"},"
+     "\"native\":{\"type\":\"boolean\",\"description\":\"Neo4j projects: raw read-only "
+     "Neo4j Cypher; $db $gen $project bound.\"},"
      "\"max_rows\":{\"type\":\"integer\","
      "\"description\":"
      "\"Visible rows (default 200; max 99998); 0 uses the legacy maximum. Evaluation is "
@@ -2658,6 +2667,11 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
             srv->owns_store = true;
             free(srv->current_project);
             srv->current_project = heap_strdup(project);
+            /* A Neo4j-backed project answers graph reads from Neo4j; the
+             * SQLite file keeps serving everything else (and the graph too
+             * when Neo4j is unusable — logged by the attach). */
+            char graph_err[CBM_SZ_512];
+            (void)cbm_neo4j_store_attach(srv->store, path, project, graph_err, sizeof(graph_err));
             return srv->store; /* fast path: filename == internal name */
         }
         /* #704: <project>.db exists but its INTERNAL project name differs from
@@ -6109,6 +6123,8 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *graph_arg = cbm_mcp_get_string_arg(args, "graph");
     bool missed_graph = graph_arg && strcmp(graph_arg, "missed") == 0;
     free(graph_arg);
+    /* native (Neo4j-backed projects): run the query in Neo4j itself. */
+    bool native = cbm_mcp_get_bool_arg(args, "native");
 
     if (!query) {
         free(cursor_arg);
@@ -6158,7 +6174,8 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     bool generation_available = generation[0] != '\0';
     const char *effective_project = project ? project : srv->current_project;
     uint64_t params_hash =
-        query_graph_params_hash(effective_project, query, missed_graph ? "missed" : "code");
+        query_graph_params_hash(effective_project, query,
+                                missed_graph ? "missed" : (native ? "native" : "code"));
     query_graph_cursor_t cursor = {0};
     if (cursor_arg) {
         if (requested_offset != 0) {
@@ -6193,7 +6210,14 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
      * Executing at visible_limit+1 corrupts ORDER BY, DISTINCT, aggregation,
      * and SKIP semantics before serialization gets a chance to trim rows.
      * Zero preserves the engine's established 100k safety ceiling. */
-    int rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
+    int rc;
+    if (native) {
+        char native_db_path[CBM_SZ_1K];
+        project_db_path(effective_project, native_db_path, sizeof(native_db_path));
+        rc = cbm_neo4j_native_query(native_db_path, effective_project, query, 0, &result);
+    } else {
+        rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
+    }
 
     if (rc < 0) {
         char *err_msg = result.error ? result.error : "query execution failed";
@@ -7412,6 +7436,43 @@ static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yy
     yyjson_mut_obj_add_val(doc, root, "watch", watch);
 }
 
+/* graph_backend: where graph reads come from. For a Neo4j-backed project
+ * whose Neo4j copy cannot serve right now, status says sqlite_fallback and
+ * names why (reads stay correct: the local copy is the same graph). */
+static void add_graph_backend_report(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     cbm_store_t *store, const char *project) {
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+    cbm_neo4j_config_t cfg;
+    char err[CBM_SZ_512] = "";
+    char synced[CBM_SZ_128] = "";
+    int rc = cbm_neo4j_sidecar_read(path, &cfg, synced, sizeof(synced), err, sizeof(err));
+    yyjson_mut_val *gb = yyjson_mut_obj(doc);
+    if (rc == 1) {
+        yyjson_mut_obj_add_str(doc, gb, "kind", "sqlite");
+    } else {
+        yyjson_mut_obj_add_str(doc, gb, "kind", "neo4j");
+        if (rc == 0) {
+            yyjson_mut_obj_add_strcpy(doc, gb, "uri", cfg.uri);
+            yyjson_mut_obj_add_strcpy(doc, gb, "database", cfg.database);
+            yyjson_mut_obj_add_strcpy(doc, gb, "synced_generation", synced);
+            cbm_neo4j_config_wipe(&cfg);
+        }
+        bool attached = cbm_store_is_remote(store);
+        yyjson_mut_obj_add_str(doc, gb, "status", attached ? "serving" : "sqlite_fallback");
+        if (!attached) {
+            /* Re-run the attach checks on a throwaway store to name the cause. */
+            cbm_store_t *probe = cbm_store_open_path_query(path);
+            if (probe) {
+                (void)cbm_neo4j_store_attach(probe, path, project, err, sizeof(err));
+                cbm_store_close(probe);
+            }
+            yyjson_mut_obj_add_strcpy(doc, gb, "reason", err[0] ? err : "unknown");
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "graph_backend", gb);
+}
+
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     cbm_store_t *store = resolve_store(srv, project);
@@ -7465,6 +7526,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                 add_git_context_json(doc, root, proj_info.root_path);
             }
         }
+        add_graph_backend_report(doc, root, store, project);
         add_coverage_report(doc, root, store, project, have_proj_info ? proj_info.indexed_at : NULL,
                             coverage_samples);
         (void)cbm_cross_repo_add_status_json(doc, root, store, project);
@@ -7547,6 +7609,23 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     const char *error_detail = NULL;
     bool is_error = false;
 
+    /* A Neo4j-backed project also loses its mirrored graph. A Neo4j failure
+     * is reported but does not keep the local index alive. */
+    char graph_status[CBM_SZ_512] = "";
+    cbm_neo4j_config_t graph_cfg;
+    char graph_err[CBM_SZ_512] = "";
+    if (cbm_neo4j_sidecar_read(path, &graph_cfg, NULL, 0, graph_err, sizeof(graph_err)) == 0) {
+        cbm_neo4j_t *gc = cbm_neo4j_connect(&graph_cfg, graph_err, sizeof(graph_err));
+        if (gc && cbm_neo4j_drop_project(gc, name, graph_err, sizeof(graph_err)) == 0) {
+            (void)snprintf(graph_status, sizeof(graph_status), "deleted");
+        } else {
+            (void)snprintf(graph_status, sizeof(graph_status), "delete_failed: %s", graph_err);
+        }
+        cbm_neo4j_close(gc);
+        cbm_neo4j_config_wipe(&graph_cfg);
+    }
+    (void)cbm_neo4j_sidecar_remove(path);
+
     if (exists) {
         int rc = cbm_unlink(path);
         (void)cbm_unlink(wal);
@@ -7578,6 +7657,9 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "status", status);
     if (error_detail) {
         yyjson_mut_obj_add_str(doc, root, "error", error_detail);
+    }
+    if (graph_status[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "neo4j", graph_status);
     }
 
     char *json = yy_doc_to_str(doc);
@@ -11938,6 +12020,62 @@ static void index_doc_candidates_apply(cbm_pipeline_t *p, index_doc_candidates_t
     }
 }
 
+static void index_free_secret(char *s) {
+    if (s) {
+        volatile char *p = s;
+        while (*p) {
+            *p++ = 0;
+        }
+        free(s);
+    }
+}
+
+/* graph_db / graph_user / graph_password / graph_database: resolve the Neo4j
+ * target, prove it accepts the credentials before any indexing work, and hand
+ * it to the pipeline. graph_db "sqlite" / "none" returns the project to the
+ * local graph. Returns 0, or -1 with err filled. */
+static int index_graph_backend_apply(cbm_pipeline_t *p, const char *args, char *err,
+                                     size_t err_sz) {
+    char *uri = cbm_mcp_get_string_arg(args, "graph_db");
+    if (!uri || !uri[0]) {
+        free(uri);
+        return 0;
+    }
+    if (strcmp(uri, "sqlite") == 0 || strcmp(uri, "none") == 0) {
+        free(uri);
+        cbm_pipeline_disable_graph_backend(p);
+        return 0;
+    }
+    char *user = cbm_mcp_get_string_arg(args, "graph_user");
+    char *password = cbm_mcp_get_string_arg(args, "graph_password");
+    char *database = cbm_mcp_get_string_arg(args, "graph_database");
+    cbm_neo4j_config_t cfg;
+    int rc = cbm_neo4j_config_resolve(uri, user, password, database, &cfg, err, err_sz);
+    free(uri);
+    free(user);
+    index_free_secret(password);
+    free(database);
+    if (rc == 0) {
+        cbm_neo4j_t *c = cbm_neo4j_connect(&cfg, err, err_sz);
+        if (!c) {
+            rc = -1;
+        } else {
+            if (cbm_neo4j_ping(c) != 0) {
+                (void)snprintf(err, err_sz, "cannot use Neo4j at %s: %s", cfg.uri,
+                               cbm_neo4j_error(c));
+                rc = -1;
+            }
+            cbm_neo4j_close(c);
+        }
+    }
+    if (rc == 0) {
+        cbm_neo4j_config_remember(&cfg);
+        cbm_pipeline_set_graph_backend(p, &cfg);
+    }
+    cbm_neo4j_config_wipe(&cfg);
+    return rc;
+}
+
 /* Preserve every index option while replacing all caller-supplied repo_path
  * keys with the one canonical path that was actually authorized. A non-empty
  * project_name likewise replaces any caller "name" (#2134: the project key the
@@ -12460,6 +12598,14 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_set_resource_policy(p, &resource_policy);
     index_doc_candidates_apply(p, doc_candidates);
+    char graph_err[CBM_SZ_1K];
+    if (index_graph_backend_apply(p, args, graph_err, sizeof(graph_err)) != 0) {
+        cbm_pipeline_free(p);
+        mcp_project_mutation_end(srv, mutation_project);
+        free(mutation_project);
+        free(repo_path);
+        return cbm_mcp_text_result(graph_err, true);
+    }
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -12617,6 +12763,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                                 serving_index_was_servable &&
                                     project_db_is_servable(project_name, serving_db_path));
         yyjson_mut_obj_add_strcpy(doc, root, "message", message);
+    } else if (rc == CBM_PIPELINE_GRAPH_SYNC_FAILED) {
+        char hint[CBM_SZ_2K];
+        (void)snprintf(hint, sizeof(hint),
+                       "The local index was published, but mirroring it into Neo4j failed: %s. "
+                       "Graph tools keep serving the previous Neo4j generation (if any). Fix "
+                       "the Neo4j connection and re-run index_repository with graph_db.",
+                       cbm_pipeline_graph_error(p));
+        yyjson_mut_obj_add_str(doc, root, "status", "graph_sync_failed");
+        yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         /* #1665: a post-publish artifact export failure (read-only repo, etc.)
