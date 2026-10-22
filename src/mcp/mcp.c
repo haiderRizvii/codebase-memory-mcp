@@ -564,7 +564,8 @@ static const tool_def_t TOOLS[] = {
      "\"Report the running or last index job (queued/running/succeeded/failed/cancelled) "
      "instead of indexing. Pass the same repo_path (and name, if any) as the index call.\"},"
      "\"graph_db\":{\"type\":\"string\",\"description\":"
-     "\"Neo4j URL http://host:7474; graph tools read it. sqlite reverts.\"},"
+     "\"Neo4j HTTP endpoint URL (port 7474, not bolt); graph tools read it. sqlite "
+     "reverts.\"},"
      "\"graph_user\":{\"type\":\"string\"},\"graph_password\":{\"type\":\"string\"},"
      "\"graph_database\":{\"type\":\"string\"}"
      "},\"required\":[\"repo_path\"]}"},

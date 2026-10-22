@@ -407,12 +407,17 @@ static int bfs_signature(cbm_store_t *s, int64_t start, const char *dir, bool mu
     return CBM_STORE_OK;
 }
 
+/* The live test needs a real Neo4j server, so the suite registers it only
+ * when one is configured (see SUITE below) -- never a silent skip. */
+static bool live_neo4j_configured(void) {
+    const char *uri = getenv("CBM_TEST_NEO4J_URI");
+    return uri && uri[0];
+}
+
 TEST(neo4j_live_sync_and_read) {
     const char *uri = getenv("CBM_TEST_NEO4J_URI");
     const char *pw = getenv("CBM_TEST_NEO4J_PASSWORD");
-    if (!uri || !uri[0]) {
-        SKIP("CBM_TEST_NEO4J_URI not set");
-    }
+    ASSERT_TRUE(uri && uri[0]);
     clear_neo4j_env();
     char *dir = th_mktempdir("cbm_n4_live");
     ASSERT_NOT_NULL(dir);
@@ -507,5 +512,10 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_sidecar_roundtrip);
     RUN_TEST(neo4j_store_remote_routing);
     RUN_TEST(neo4j_native_query_is_read_only);
-    RUN_TEST(neo4j_live_sync_and_read);
+    if (live_neo4j_configured()) {
+        RUN_TEST(neo4j_live_sync_and_read);
+    } else {
+        printf("  (neo4j live test not registered: set CBM_TEST_NEO4J_URI and "
+               "CBM_TEST_NEO4J_PASSWORD to run it against a server)\n");
+    }
 }
