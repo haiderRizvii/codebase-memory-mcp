@@ -328,8 +328,7 @@ static bool n4_header(const char *hdrs, const char *end, const char *name, char 
         while (eol < end && *eol != '\r') {
             eol++;
         }
-        if ((size_t)(eol - line) > nl && line[nl] == ':' &&
-            n4_has_prefix_ci(line, name)) {
+        if ((size_t)(eol - line) > nl && line[nl] == ':' && n4_has_prefix_ci(line, name)) {
             const char *v = line + nl + 1;
             while (v < eol && (*v == ' ' || *v == '\t')) {
                 v++;
@@ -448,8 +447,7 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
             *retryable = reused && b.len == 0;
             free(b.data);
             n4_disconnect(h);
-            n4_err(err, err_sz, "no response from Neo4j (connection closed or timed out)%s",
-                   NULL);
+            n4_err(err, err_sz, "no response from Neo4j (connection closed or timed out)%s", NULL);
             return -1;
         }
     }
@@ -464,8 +462,8 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
     char val[128];
     bool chunked = n4_header(b.data, hdr_end + 2, "Transfer-Encoding", val, sizeof(val)) &&
                    strstr(val, "chunked") != NULL;
-    bool conn_close =
-        n4_header(b.data, hdr_end + 2, "Connection", val, sizeof(val)) && n4_has_prefix_ci(val, "close");
+    bool conn_close = n4_header(b.data, hdr_end + 2, "Connection", val, sizeof(val)) &&
+                      n4_has_prefix_ci(val, "close");
     long long content_len = -1;
     if (!chunked && n4_header(b.data, hdr_end + 2, "Content-Length", val, sizeof(val))) {
         content_len = strtoll(val, NULL, 10);
@@ -529,8 +527,7 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
         consumed = body_off + out_len;
     } else {
         /* Body delimited by connection close. */
-        while (n4_recv_more(h, &b) > 0) {
-        }
+        while (n4_recv_more(h, &b) > 0) {}
         out_len = b.len - body_off;
         consumed = b.len;
         conn_close = true;

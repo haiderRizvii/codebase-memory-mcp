@@ -404,8 +404,8 @@ typedef struct cbm_store_remote_ops {
     const char *(*error)(void *ctx);
     int (*find_node_by_id)(void *ctx, int64_t id, cbm_node_t *out);
     int (*find_node_by_qn)(void *ctx, const char *project, const char *qn, cbm_node_t *out);
-    int (*find_nodes)(void *ctx, cbm_remote_node_query_t kind, const char *project,
-                      const char *arg, cbm_node_t **out, int *count);
+    int (*find_nodes)(void *ctx, cbm_remote_node_query_t kind, const char *project, const char *arg,
+                      cbm_node_t **out, int *count);
     /* by_target: edges INTO node_id; type NULL = any type. */
     int (*find_edges)(void *ctx, int64_t node_id, bool by_target, const char *type,
                       cbm_edge_t **out, int *count);

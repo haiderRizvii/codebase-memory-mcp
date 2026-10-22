@@ -3362,8 +3362,8 @@ static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
 
 int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, int *count) {
     if (s && s->remote_ops) {
-        return remote_status(
-            s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_ALL, project, NULL, out, count));
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_ALL,
+                                                          project, NULL, out, count));
     }
     if (!s) {
         *out = NULL;
@@ -3380,8 +3380,8 @@ int cbm_store_find_nodes(cbm_store_t *s, const char *project, cbm_node_t **out, 
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count) {
     if (s && s->remote_ops) {
-        return remote_status(
-            s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_NAME, project, name, out, count));
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_NAME,
+                                                          project, name, out, count));
     }
     if (!s) {
         *out = NULL;
@@ -3398,8 +3398,8 @@ int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                   cbm_node_t **out, int *count) {
     if (s && s->remote_ops) {
-        return remote_status(
-            s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_LABEL, project, label, out, count));
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_LABEL,
+                                                          project, label, out, count));
     }
     if (!s) {
         *out = NULL;
@@ -3416,8 +3416,8 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count) {
     if (s && s->remote_ops) {
-        return remote_status(
-            s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_FILE, project, file_path, out, count));
+        return remote_status(s, s->remote_ops->find_nodes(s->remote_ctx, CBM_REMOTE_NODES_BY_FILE,
+                                                          project, file_path, out, count));
     }
     if (!s) {
         *out = NULL;
@@ -6295,8 +6295,8 @@ int cbm_store_batch_count_degrees(cbm_store_t *s, const int64_t *node_ids, int i
     if (s && s->remote_ops && node_ids && id_count > 0 && out_in && out_out) {
         memset(out_in, 0, (size_t)id_count * sizeof(int));
         memset(out_out, 0, (size_t)id_count * sizeof(int));
-        return remote_status(s, s->remote_ops->degrees(s->remote_ctx, node_ids, id_count,
-                                                       edge_type, out_in, out_out));
+        return remote_status(s, s->remote_ops->degrees(s->remote_ctx, node_ids, id_count, edge_type,
+                                                       out_in, out_out));
     }
     if (!s || !node_ids || id_count <= 0 || !out_in || !out_out) {
         return CBM_STORE_ERR;
@@ -7931,10 +7931,10 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
         max_results = 0;
     }
     if (s && s->remote_ops) {
-        return remote_status(s, s->remote_ops->bfs(s->remote_ctx, &start_id, SKIP_ONE, false,
-                                                   direction, edge_types, edge_type_count,
-                                                   max_depth, max_results, trail, max_edges, out,
-                                                   NULL));
+        return remote_status(s,
+                             s->remote_ops->bfs(s->remote_ctx, &start_id, SKIP_ONE, false,
+                                                direction, edge_types, edge_type_count, max_depth,
+                                                max_results, trail, max_edges, out, NULL));
     }
 
     cbm_node_t root = {0};

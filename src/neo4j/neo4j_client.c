@@ -205,8 +205,7 @@ int cbm_neo4j_config_from_meta(const char *meta_json, cbm_neo4j_config_t *out, c
     memset(out, 0, sizeof(*out));
     copy_str(out->uri, sizeof(out->uri), yyjson_get_str(yyjson_obj_get(o, "uri")));
     copy_str(out->user, sizeof(out->user), yyjson_get_str(yyjson_obj_get(o, "user")));
-    copy_str(out->database, sizeof(out->database),
-             yyjson_get_str(yyjson_obj_get(o, "database")));
+    copy_str(out->database, sizeof(out->database), yyjson_get_str(yyjson_obj_get(o, "database")));
     yyjson_doc_free(d);
     if (!out->uri[0]) {
         (void)snprintf(err, err_sz, "graph backend metadata has no uri");
@@ -294,6 +293,39 @@ static void set_err(cbm_neo4j_t *c, const char *fmt, const char *a, const char *
     (void)snprintf(c->err, sizeof(c->err), fmt, a ? a : "", b2 ? b2 : "");
 }
 
+/* NULL when results holds exactly one well-formed entry per statement sent:
+ * {"columns": [...], "data": [{"row": [one value per column]}, ...]}.
+ * Otherwise a short description of the first defect. */
+const char *cbm_neo4j_result_shape_error(yyjson_val *results, int statements) {
+    if (!yyjson_is_arr(results)) {
+        return "no results array";
+    }
+    if (yyjson_arr_size(results) != (size_t)statements) {
+        return "result count does not match the statements sent";
+    }
+    size_t idx;
+    size_t max;
+    yyjson_val *res;
+    yyjson_arr_foreach(results, idx, max, res) {
+        yyjson_val *columns = yyjson_obj_get(res, "columns");
+        yyjson_val *data = yyjson_obj_get(res, "data");
+        if (!yyjson_is_arr(columns) || !yyjson_is_arr(data)) {
+            return "result without columns/data arrays";
+        }
+        size_t ncols = yyjson_arr_size(columns);
+        size_t ri;
+        size_t rmax;
+        yyjson_val *entry;
+        yyjson_arr_foreach(data, ri, rmax, entry) {
+            yyjson_val *row = yyjson_obj_get(entry, "row");
+            if (!yyjson_is_arr(row) || yyjson_arr_size(row) != ncols) {
+                return "row does not match its columns";
+            }
+        }
+    }
+    return NULL;
+}
+
 int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t *out) {
     if (out) {
         memset(out, 0, sizeof(*out));
@@ -313,8 +345,8 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
     size_t resp_len = 0;
     char terr[CBM_NEO4J_ERR_MAX];
     terr[0] = '\0';
-    int rc = cbm_neo4j_http_post(c->http, c->commit_path, body, body_len, &status, &resp,
-                                 &resp_len, terr, sizeof(terr));
+    int rc = cbm_neo4j_http_post(c->http, c->commit_path, body, body_len, &status, &resp, &resp_len,
+                                 terr, sizeof(terr));
     free(body);
     if (rc != 0) {
         set_err(c, "%s%s", terr[0] ? terr : "Neo4j request failed", NULL);
@@ -322,15 +354,17 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
         return -1;
     }
     if (status == 401 || status == 403) {
-        set_err(c, "Neo4j rejected the credentials for %s (HTTP 401/403); check "
-                   "--graph-user/--graph-password or NEO4J_USER/NEO4J_PASSWORD%s",
+        set_err(c,
+                "Neo4j rejected the credentials for %s (HTTP 401/403); check "
+                "--graph-user/--graph-password or NEO4J_USER/NEO4J_PASSWORD%s",
                 c->uri, NULL);
         free(resp);
         return -1;
     }
     if (status == 404) {
-        set_err(c, "Neo4j endpoint %s not found (HTTP 404): wrong database name or not a "
-                   "Neo4j HTTP port%s",
+        set_err(c,
+                "Neo4j endpoint %s not found (HTTP 404): wrong database name or not a "
+                "Neo4j HTTP port%s",
                 c->commit_path, NULL);
         free(resp);
         return -1;
@@ -357,6 +391,16 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
         char sc[16];
         (void)snprintf(sc, sizeof(sc), "%d", status);
         set_err(c, "Neo4j returned HTTP %s%s", sc, NULL);
+        yyjson_doc_free(d);
+        return -1;
+    }
+    /* A 2xx body must still be a complete transactional result. Anything
+     * else (a proxy or another service answering 200, a truncated reply)
+     * would read as "no rows" -- an empty graph to every reader, and a
+     * generation of 0 to the sync -- so it is an error, never a success. */
+    const char *shape_err = cbm_neo4j_result_shape_error(yyjson_obj_get(root, "results"), b->count);
+    if (shape_err) {
+        set_err(c, "malformed Neo4j response from %s: %s", c->uri, shape_err);
         yyjson_doc_free(d);
         return -1;
     }

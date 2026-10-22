@@ -15,6 +15,7 @@
 #include "neo4j/neo4j_http.h"
 #include "neo4j/neo4j_store.h"
 #include "neo4j/neo4j_sync.h"
+#include "mcp/mcp.h"
 #include "store/store.h"
 
 #include <stdio.h>
@@ -66,8 +67,8 @@ TEST(neo4j_url_rejects_bolt_and_garbage) {
 
 TEST(neo4j_base64_vectors) {
     static const char *const in[] = {"", "f", "fo", "foo", "foob", "fooba", "foobar"};
-    static const char *const out[] = {"", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=",
-                                      "Zm9vYmFy"};
+    static const char *const out[] = {"",         "Zg==",     "Zm8=",    "Zm9v",
+                                      "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy"};
     for (int i = 0; i < 7; i++) {
         char *b = cbm_neo4j_base64(in[i], strlen(in[i]));
         ASSERT_NOT_NULL(b);
@@ -99,19 +100,16 @@ TEST(neo4j_config_explicit_beats_env) {
     ASSERT_STR_EQ(c.user, "u");
     ASSERT_STR_EQ(c.password, "p");
     ASSERT_STR_EQ(c.database, "d");
-    ASSERT_EQ(cbm_neo4j_config_resolve("http://h:7474", NULL, NULL, NULL, &c, err, sizeof(err)),
-              0);
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://h:7474", NULL, NULL, NULL, &c, err, sizeof(err)), 0);
     ASSERT_STR_EQ(c.user, "envuser");
     ASSERT_STR_EQ(c.password, "envpw");
     ASSERT_STR_EQ(c.database, "envdb");
     /* The supervisor hand-off outranks the ambient NEO4J_PASSWORD. */
     cbm_setenv(CBM_NEO4J_PASSWORD_ENV, "handoff", 1);
-    ASSERT_EQ(cbm_neo4j_config_resolve("http://h:7474", NULL, NULL, NULL, &c, err, sizeof(err)),
-              0);
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://h:7474", NULL, NULL, NULL, &c, err, sizeof(err)), 0);
     ASSERT_STR_EQ(c.password, "handoff");
     clear_neo4j_env();
-    ASSERT_EQ(cbm_neo4j_config_resolve("http://h:7474", NULL, NULL, NULL, &c, err, sizeof(err)),
-              0);
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://h:7474", NULL, NULL, NULL, &c, err, sizeof(err)), 0);
     ASSERT_STR_EQ(c.user, "neo4j");
     ASSERT_STR_EQ(c.database, "neo4j");
     PASS();
@@ -176,8 +174,7 @@ TEST(neo4j_sidecar_roundtrip) {
     char err[256];
     char gen[64];
     ASSERT_EQ(cbm_neo4j_sidecar_read(db, &c, gen, sizeof(gen), err, sizeof(err)), 1);
-    ASSERT_EQ(cbm_neo4j_config_resolve("http://side:7474", "bob", "pw", NULL, &c, err,
-                                       sizeof(err)),
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://side:7474", "bob", "pw", NULL, &c, err, sizeof(err)),
               0);
     ASSERT_EQ(cbm_neo4j_sidecar_write(db, &c, "u1g2"), 0);
     cbm_neo4j_config_t back;
@@ -238,8 +235,7 @@ static int fake_find_node_by_id(void *ctx, int64_t id, cbm_node_t *out) {
     out->properties_json = fake_dup("{}");
     return CBM_STORE_OK;
 }
-static int fake_find_node_by_qn(void *ctx, const char *project, const char *qn,
-                                cbm_node_t *out) {
+static int fake_find_node_by_qn(void *ctx, const char *project, const char *qn, cbm_node_t *out) {
     return CBM_STORE_NOT_FOUND;
 }
 static int fake_find_nodes(void *ctx, cbm_remote_node_query_t kind, const char *project,
@@ -263,8 +259,7 @@ static int fake_find_edges_by_type(void *ctx, const char *project, const char *t
 static int fake_count(void *ctx, cbm_remote_count_t kind, const char *project, const char *arg) {
     return kind == CBM_REMOTE_COUNT_NODES ? 1234 : 7;
 }
-static int fake_degrees(void *ctx, const int64_t *ids, int n, const char *type, int *in,
-                        int *out) {
+static int fake_degrees(void *ctx, const int64_t *ids, int n, const char *type, int *in, int *out) {
     for (int i = 0; i < n; i++) {
         in[i] = 3;
         out[i] = 5;
@@ -339,9 +334,10 @@ TEST(neo4j_store_remote_routing) {
 
 TEST(neo4j_native_query_is_read_only) {
     static const char *const writes[] = {
-        "MATCH (n) DETACH DELETE n", "create (n:X)", "MATCH (n) SET n.x = 1",
-        "MERGE (a:A)", "CALL db.clearQueryCaches()", "LOAD CSV FROM 'x' AS r RETURN r",
-        "MATCH (n) REMOVE n.x", "FOREACH (x IN [1] | CREATE (:A))"};
+        "MATCH (n) DETACH DELETE n",  "create (n:X)",
+        "MATCH (n) SET n.x = 1",      "MERGE (a:A)",
+        "CALL db.clearQueryCaches()", "LOAD CSV FROM 'x' AS r RETURN r",
+        "MATCH (n) REMOVE n.x",       "FOREACH (x IN [1] | CREATE (:A))"};
     for (size_t i = 0; i < sizeof(writes) / sizeof(writes[0]); i++) {
         cbm_cypher_result_t r;
         ASSERT_EQ(cbm_neo4j_native_query("/nonexistent/x.db", "p", writes[i], 0, &r), -1);
@@ -353,12 +349,108 @@ TEST(neo4j_native_query_is_read_only) {
      * such a query passes the guard and fails only on the missing project. */
     cbm_cypher_result_t r;
     ASSERT_EQ(cbm_neo4j_native_query("/nonexistent/x.db", "p",
-                                     "MATCH (n {name:'CREATE'}) // DELETE\nRETURN n.`set`", 0,
-                                     &r),
+                                     "MATCH (n {name:'CREATE'}) // DELETE\nRETURN n.`set`", 0, &r),
               -1);
     ASSERT_NOT_NULL(r.error);
     ASSERT_NULL(strstr(r.error, "read-only"));
     cbm_cypher_result_free(&r);
+    PASS();
+}
+
+/* ── Response validation and fallback visibility ─────────────────── */
+
+static const char *shape_of(const char *json, int statements) {
+    static char verdict[128];
+    yyjson_doc *d = yyjson_read(json, strlen(json), 0);
+    const char *e =
+        cbm_neo4j_result_shape_error(yyjson_obj_get(yyjson_doc_get_root(d), "results"), statements);
+    (void)snprintf(verdict, sizeof(verdict), "%s", e ? e : "ok");
+    yyjson_doc_free(d);
+    return verdict;
+}
+
+TEST(neo4j_rejects_malformed_2xx_bodies) {
+    /* A complete reply is accepted, including a statement with no rows. */
+    ASSERT_STR_EQ(shape_of("{\"results\":[{\"columns\":[\"a\",\"b\"],\"data\":[{\"row\":[1,2]}]},"
+                           "{\"columns\":[\"n\"],\"data\":[]}],\"errors\":[]}",
+                           2),
+                  "ok");
+    /* Everything else must be an error, never "no rows": a 200 from a proxy
+     * or another service, a truncated reply, or rows that do not fit. */
+    ASSERT_STR_NEQ(shape_of("{\"errors\":[]}", 1), "ok");
+    ASSERT_STR_NEQ(shape_of("{\"results\":{},\"errors\":[]}", 1), "ok");
+    ASSERT_STR_NEQ(shape_of("{\"results\":[],\"errors\":[]}", 1), "ok");
+    ASSERT_STR_NEQ(shape_of("{\"results\":[{\"columns\":[\"a\"],\"data\":[]}]}", 2), "ok");
+    ASSERT_STR_NEQ(shape_of("{\"results\":[{\"data\":[]}]}", 1), "ok");
+    ASSERT_STR_NEQ(
+        shape_of("{\"results\":[{\"columns\":[\"a\",\"b\"],\"data\":[{\"row\":[1]}]}]}", 1), "ok");
+    ASSERT_STR_NEQ(shape_of("{\"results\":[{\"columns\":[\"a\"],\"data\":[{\"meta\":[]}]}]}", 1),
+                   "ok");
+    PASS();
+}
+
+TEST(neo4j_sidecar_records_last_sync_error) {
+    clear_neo4j_env();
+    char *dir = th_mktempdir("cbm_n4_status");
+    ASSERT_NOT_NULL(dir);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/proj.db", dir);
+    cbm_neo4j_config_t c;
+    char err[256];
+    ASSERT_EQ(cbm_neo4j_config_resolve("http://side:7474", "bob", "pw", NULL, &c, err, sizeof(err)),
+              0);
+    char field[256];
+    ASSERT_EQ(cbm_neo4j_sidecar_field(db, "last_sync_error", field, sizeof(field)), -1);
+    /* A failed background sync keeps the last good generation and says why. */
+    ASSERT_EQ(cbm_neo4j_sidecar_write_status(db, &c, "u1g2", "cannot connect to Neo4j"), 0);
+    ASSERT_EQ(cbm_neo4j_sidecar_field(db, "last_sync_error", field, sizeof(field)), 0);
+    ASSERT_STR_EQ(field, "cannot connect to Neo4j");
+    ASSERT_EQ(cbm_neo4j_sidecar_field(db, "synced_generation", field, sizeof(field)), 0);
+    ASSERT_STR_EQ(field, "u1g2");
+    /* The next successful sync clears it. */
+    ASSERT_EQ(cbm_neo4j_sidecar_write(db, &c, "u1g3"), 0);
+    ASSERT_EQ(cbm_neo4j_sidecar_field(db, "last_sync_error", field, sizeof(field)), 0);
+    ASSERT_STR_EQ(field, "");
+    th_rmtree(dir);
+    PASS();
+}
+
+TEST(neo4j_fallback_is_visible_in_tool_replies) {
+    /* Structured reply: a text notice plus structuredContent.graph_backend. */
+    char *reply = cbm_mcp_result_add_graph_fallback(cbm_mcp_text_result("{\"rows\":3}", false),
+                                                    "Neo4j unreachable");
+    ASSERT_NOT_NULL(reply);
+    yyjson_doc *d = yyjson_read(reply, strlen(reply), 0);
+    yyjson_val *root = yyjson_doc_get_root(d);
+    yyjson_val *content = yyjson_obj_get(root, "content");
+    ASSERT_EQ((int)yyjson_arr_size(content), 2);
+    const char *notice = yyjson_get_str(yyjson_obj_get(yyjson_arr_get(content, 1), "text"));
+    ASSERT_NOT_NULL(notice);
+    ASSERT_NOT_NULL(strstr(notice, "sqlite_fallback"));
+    ASSERT_NOT_NULL(strstr(notice, "Neo4j unreachable"));
+    yyjson_val *gb = yyjson_obj_get(yyjson_obj_get(root, "structuredContent"), "graph_backend");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "status")), "sqlite_fallback");
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(gb, "reason")), "Neo4j unreachable");
+    /* The original payload is untouched. */
+    ASSERT_EQ(
+        (int)yyjson_get_int(yyjson_obj_get(yyjson_obj_get(root, "structuredContent"), "rows")), 3);
+    yyjson_doc_free(d);
+    free(reply);
+
+    /* Text-shaped reply: the notice still lands in content. */
+    reply = cbm_mcp_result_add_graph_fallback(cbm_mcp_text_result("rows: 3", false), "stale");
+    d = yyjson_read(reply, strlen(reply), 0);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(yyjson_doc_get_root(d), "content")), 2);
+    yyjson_doc_free(d);
+    free(reply);
+
+    /* Not a tool-result object: returned unchanged. */
+    char *plain = malloc(8);
+    memcpy(plain, "garbage", 8);
+    reply = cbm_mcp_result_add_graph_fallback(plain, "x");
+    ASSERT_STR_EQ(reply, "garbage");
+    free(reply);
+    ASSERT_NULL(cbm_mcp_result_add_graph_fallback(NULL, "x"));
     PASS();
 }
 
@@ -441,10 +533,8 @@ TEST(neo4j_live_sync_and_read) {
     ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
 
     char sql_out[2][1024];
-    ASSERT_EQ(bfs_signature(s, a, "outbound", false, sql_out[0], sizeof(sql_out[0])),
-              CBM_STORE_OK);
-    ASSERT_EQ(bfs_signature(s, c, "inbound", true, sql_out[1], sizeof(sql_out[1])),
-              CBM_STORE_OK);
+    ASSERT_EQ(bfs_signature(s, a, "outbound", false, sql_out[0], sizeof(sql_out[0])), CBM_STORE_OK);
+    ASSERT_EQ(bfs_signature(s, c, "inbound", true, sql_out[1], sizeof(sql_out[1])), CBM_STORE_OK);
     cbm_store_close(s);
 
     cbm_neo4j_config_t cfg;
@@ -512,6 +602,9 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_sidecar_roundtrip);
     RUN_TEST(neo4j_store_remote_routing);
     RUN_TEST(neo4j_native_query_is_read_only);
+    RUN_TEST(neo4j_rejects_malformed_2xx_bodies);
+    RUN_TEST(neo4j_sidecar_records_last_sync_error);
+    RUN_TEST(neo4j_fallback_is_visible_in_tool_replies);
     if (live_neo4j_configured()) {
         RUN_TEST(neo4j_live_sync_and_read);
     } else {

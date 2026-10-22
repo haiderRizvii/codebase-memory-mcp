@@ -1877,6 +1877,10 @@ struct cbm_mcp_server {
      * "project not found". */
     bool readonly_resolve_hit_corrupt;
     char readonly_corrupt_project[CBM_SZ_1K];
+    /* Set when this request's project is Neo4j-backed but its graph reads
+     * fell back to the local index; cbm_mcp_handle_tool attaches it to the
+     * reply so a fallback is never silent. Cleared at request start. */
+    char graph_fallback_reason[CBM_SZ_512];
 
     /* Session + auto-index state */
     char session_root[CBM_SZ_1K];     /* detected project root path */
@@ -2672,7 +2676,11 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
              * SQLite file keeps serving everything else (and the graph too
              * when Neo4j is unusable — logged by the attach). */
             char graph_err[CBM_SZ_512];
-            (void)cbm_neo4j_store_attach(srv->store, path, project, graph_err, sizeof(graph_err));
+            if (cbm_neo4j_store_attach(srv->store, path, project, graph_err, sizeof(graph_err)) ==
+                CBM_NEO4J_ATTACH_FALLBACK) {
+                (void)snprintf(srv->graph_fallback_reason, sizeof(srv->graph_fallback_reason), "%s",
+                               graph_err[0] ? graph_err : "Neo4j unavailable");
+            }
             return srv->store; /* fast path: filename == internal name */
         }
         /* #704: <project>.db exists but its INTERNAL project name differs from
@@ -6174,9 +6182,8 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     bool generation_available = generation[0] != '\0';
     const char *effective_project = project ? project : srv->current_project;
-    uint64_t params_hash =
-        query_graph_params_hash(effective_project, query,
-                                missed_graph ? "missed" : (native ? "native" : "code"));
+    uint64_t params_hash = query_graph_params_hash(
+        effective_project, query, missed_graph ? "missed" : (native ? "native" : "code"));
     query_graph_cursor_t cursor = {0};
     if (cursor_arg) {
         if (requested_offset != 0) {
@@ -7440,8 +7447,8 @@ static void add_watch_status_json(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yy
 /* graph_backend: where graph reads come from. For a Neo4j-backed project
  * whose Neo4j copy cannot serve right now, status says sqlite_fallback and
  * names why (reads stay correct: the local copy is the same graph). */
-static void add_graph_backend_report(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                     cbm_store_t *store, const char *project) {
+static void add_graph_backend_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                     const char *project) {
     char path[CBM_SZ_1K];
     project_db_path(project, path, sizeof(path));
     cbm_neo4j_config_t cfg;
@@ -7458,6 +7465,18 @@ static void add_graph_backend_report(yyjson_mut_doc *doc, yyjson_mut_val *root,
             yyjson_mut_obj_add_strcpy(doc, gb, "database", cfg.database);
             yyjson_mut_obj_add_strcpy(doc, gb, "synced_generation", synced);
             cbm_neo4j_config_wipe(&cfg);
+            /* in_sync: the last generation sent to Neo4j is the one the local
+             * index publishes now. A background (watcher) re-index whose sync
+             * failed leaves it false, with last_sync_error naming why. */
+            char local[CBM_SZ_128] = "";
+            (void)cbm_store_generation(store, local, sizeof(local));
+            yyjson_mut_obj_add_strcpy(doc, gb, "local_generation", local);
+            yyjson_mut_obj_add_bool(doc, gb, "in_sync", local[0] && strcmp(local, synced) == 0);
+            char last_error[CBM_SZ_512] = "";
+            (void)cbm_neo4j_sidecar_field(path, "last_sync_error", last_error, sizeof(last_error));
+            if (last_error[0]) {
+                yyjson_mut_obj_add_strcpy(doc, gb, "last_sync_error", last_error);
+            }
         }
         bool attached = cbm_store_is_remote(store);
         yyjson_mut_obj_add_str(doc, gb, "status", attached ? "serving" : "sqlite_fallback");
@@ -20761,6 +20780,53 @@ static bool mcp_tool_reads_in_batch(const char *tool_name) {
     return false;
 }
 
+/* A Neo4j-backed project whose graph reads fell back to the local index
+ * (Neo4j unreachable, credentials rejected, or holding another generation):
+ * the answer is still correct -- the local index is the newest published
+ * generation and Neo4j only mirrors it -- but the caller must be able to see
+ * that Neo4j did not serve it. Appends a text notice to content and, for a
+ * structured reply, a graph_backend object. Takes ownership of result; on any
+ * failure the original reply is returned unchanged. */
+char *cbm_mcp_result_add_graph_fallback(char *result, const char *reason) {
+    if (!result) {
+        return NULL;
+    }
+    yyjson_doc *in = yyjson_read(result, strlen(result), 0);
+    yyjson_mut_doc *doc = in ? yyjson_doc_mut_copy(in, NULL) : NULL;
+    yyjson_doc_free(in);
+    yyjson_mut_val *root = doc ? yyjson_mut_doc_get_root(doc) : NULL;
+    yyjson_mut_val *content = root ? yyjson_mut_obj_get(root, "content") : NULL;
+    if (!yyjson_mut_is_arr(content)) {
+        yyjson_mut_doc_free(doc);
+        return result;
+    }
+    char notice[CBM_SZ_1K];
+    (void)snprintf(notice, sizeof(notice),
+                   "graph_backend: sqlite_fallback -- this Neo4j-backed project was answered from "
+                   "the local index, not Neo4j (%s). The answer is current; Neo4j is not. Re-run "
+                   "index_repository with graph_db to resync, and see index_status.",
+                   reason);
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "type", "text");
+    yyjson_mut_obj_add_strcpy(doc, item, "text", notice);
+    yyjson_mut_arr_append(content, item);
+    yyjson_mut_val *structured = yyjson_mut_obj_get(root, "structuredContent");
+    if (yyjson_mut_is_obj(structured) && !yyjson_mut_obj_get(structured, "graph_backend")) {
+        yyjson_mut_val *gb = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, gb, "kind", "neo4j");
+        yyjson_mut_obj_add_str(doc, gb, "status", "sqlite_fallback");
+        yyjson_mut_obj_add_strcpy(doc, gb, "reason", reason);
+        yyjson_mut_obj_add_val(doc, structured, "graph_backend", gb);
+    }
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    if (!out) {
+        return result;
+    }
+    free(result);
+    return out;
+}
+
 /* File-backed query stores are request-scoped. Keeping one open between MCP
  * calls pins an old database generation after another process atomically
  * replaces the project DB. On Windows it can also prevent that replacement
@@ -20798,8 +20864,12 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     cbm_mem_phase_mark("request.dispatch_tool");
     if (srv) {
         srv->read_batch_tool = mcp_tool_reads_in_batch(tool_name);
+        srv->graph_fallback_reason[0] = '\0';
     }
     char *result = dispatch_tool(srv, tool_name, args_json);
+    if (srv && srv->graph_fallback_reason[0]) {
+        result = cbm_mcp_result_add_graph_fallback(result, srv->graph_fallback_reason);
+    }
     if (srv) {
         /* An embedded store outlives the request: end its batch here. */
         srv->read_batch_tool = false;

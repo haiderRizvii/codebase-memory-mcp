@@ -30,6 +30,12 @@ int cbm_neo4j_sidecar_read(const char *db_path, cbm_neo4j_config_t *cfg, char *s
                            size_t synced_sz, char *err, size_t err_sz);
 int cbm_neo4j_sidecar_write(const char *db_path, const cbm_neo4j_config_t *cfg,
                             const char *synced_generation);
+/* As above, also recording why the last sync failed (NULL/"" = it succeeded),
+ * so a failed background sync stays visible through index_status. */
+int cbm_neo4j_sidecar_write_status(const char *db_path, const cbm_neo4j_config_t *cfg,
+                                   const char *synced_generation, const char *last_sync_error);
+/* One string field of the marker ("" when absent). 0, or -1 without marker. */
+int cbm_neo4j_sidecar_field(const char *db_path, const char *key, char *out, size_t out_sz);
 int cbm_neo4j_sidecar_remove(const char *db_path);
 
 /* Create the indexes/constraints the sync and the read path rely on.

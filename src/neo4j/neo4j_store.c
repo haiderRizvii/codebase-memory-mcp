@@ -22,8 +22,8 @@
 #define N4S_ID_CHUNK 5000
 
 /* Node columns, in cbm_node_t order. */
-#define N4S_NODE_COLS(v)                                                                          \
-    v ".id, " v ".project, " v ".label, " v ".name, " v ".qualified_name, " v ".file_path, " v      \
+#define N4S_NODE_COLS(v)                                                                       \
+    v ".id, " v ".project, " v ".label, " v ".name, " v ".qualified_name, " v ".file_path, " v \
       ".start_line, " v ".end_line, " v ".properties_json"
 #define N4S_NODE_NCOLS 9
 
@@ -177,8 +177,8 @@ static int op_find_node_by_id(void *ctx, int64_t id, cbm_node_t *out) {
     n4s_ctx_t *x = ctx;
     n4s_q_t q;
     if (q_begin(x, &q,
-                "MATCH (n:CbmNode {db: $db, gen: $gen, id: $id}) RETURN " N4S_NODE_COLS("n")
-                " LIMIT 1") != 0) {
+                "MATCH (n:CbmNode {db: $db, gen: $gen, id: $id}) RETURN " N4S_NODE_COLS(
+                    "n") " LIMIT 1") != 0) {
         return CBM_STORE_ERR;
     }
     q_int(&q, "id", id);
@@ -190,8 +190,8 @@ static int op_find_node_by_qn(void *ctx, const char *project, const char *qn, cb
     n4s_q_t q;
     if (q_begin(x, &q,
                 "MATCH (n:CbmNode {db: $db, gen: $gen, qualified_name: $qn}) "
-                "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS("n")
-                " ORDER BY n.id LIMIT 1") != 0) {
+                "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS(
+                    "n") " ORDER BY n.id LIMIT 1") != 0) {
         return CBM_STORE_ERR;
     }
     q_str(&q, "qn", qn);
@@ -206,23 +206,23 @@ static int op_find_nodes(void *ctx, cbm_remote_node_query_t kind, const char *pr
     switch (kind) {
     case CBM_REMOTE_NODES_ALL:
         cypher = "MATCH (n:CbmNode {db: $db, gen: $gen}) "
-                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS("n")
-                 " ORDER BY n.file_path, n.id";
+                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS(
+                     "n") " ORDER BY n.file_path, n.id";
         break;
     case CBM_REMOTE_NODES_BY_NAME:
         cypher = "MATCH (n:CbmNode {db: $db, gen: $gen, name: $arg}) "
-                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS("n")
-                 " ORDER BY n.id";
+                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS(
+                     "n") " ORDER BY n.id";
         break;
     case CBM_REMOTE_NODES_BY_LABEL:
         cypher = "MATCH (n:CbmNode {db: $db, gen: $gen, label: $arg}) "
-                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS("n")
-                 " ORDER BY n.id";
+                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS(
+                     "n") " ORDER BY n.id";
         break;
     case CBM_REMOTE_NODES_BY_FILE:
         cypher = "MATCH (n:CbmNode {db: $db, gen: $gen, file_path: $arg}) "
-                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS("n")
-                 " ORDER BY n.id";
+                 "WHERE $project IS NULL OR n.project = $project RETURN " N4S_NODE_COLS(
+                     "n") " ORDER BY n.id";
         break;
     default:
         return CBM_STORE_ERR;
@@ -267,19 +267,20 @@ static int collect_edges(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count)
     return CBM_STORE_OK;
 }
 
-#define N4S_EDGE_RET                                                                              \
+#define N4S_EDGE_RET \
     " RETURN r.id, a.project, a.id, b.id, coalesce(r.type, type(r)), r.properties_json"
 
 static int op_find_edges(void *ctx, int64_t node_id, bool by_target, const char *type,
                          cbm_edge_t **out, int *count) {
     n4s_ctx_t *x = ctx;
     const char *cypher =
-        by_target ? "MATCH (a:CbmNode)-[r]->(b:CbmNode {db: $db, gen: $gen, id: $id}) "
-                    "WHERE a.db = $db AND a.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
-                    " ORDER BY r.id"
-                  : "MATCH (a:CbmNode {db: $db, gen: $gen, id: $id})-[r]->(b:CbmNode) "
-                    "WHERE b.db = $db AND b.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
-                    " ORDER BY r.id";
+        by_target
+            ? "MATCH (a:CbmNode)-[r]->(b:CbmNode {db: $db, gen: $gen, id: $id}) "
+              "WHERE a.db = $db AND a.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
+              " ORDER BY r.id"
+            : "MATCH (a:CbmNode {db: $db, gen: $gen, id: $id})-[r]->(b:CbmNode) "
+              "WHERE b.db = $db AND b.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
+              " ORDER BY r.id";
     n4s_q_t q;
     if (q_begin(x, &q, cypher) != 0) {
         return CBM_STORE_ERR;
@@ -289,8 +290,8 @@ static int op_find_edges(void *ctx, int64_t node_id, bool by_target, const char 
     return collect_edges(x, &q, out, count);
 }
 
-static int op_find_edges_by_type(void *ctx, const char *project, const char *type,
-                                 cbm_edge_t **out, int *count) {
+static int op_find_edges_by_type(void *ctx, const char *project, const char *type, cbm_edge_t **out,
+                                 int *count) {
     n4s_ctx_t *x = ctx;
     n4s_q_t q;
     if (q_begin(x, &q,
@@ -334,9 +335,8 @@ static int op_count(void *ctx, cbm_remote_count_t kind, const char *project, con
     if (q_run(x, &q, &r) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    int64_t n =
-        cbm_neo4j_val_int(cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0)), 0),
-                          0);
+    int64_t n = cbm_neo4j_val_int(
+        cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0)), 0), 0);
     cbm_neo4j_result_free(&r);
     return n > INT_MAX ? INT_MAX : (int)n;
 }
@@ -512,8 +512,8 @@ static int bfs_expand(n4s_ctx_t *x, const n4s_ids_t *frontier, bool inbound, con
 }
 
 /* Fetch node rows for ids and place them in visited[] in the given order. */
-static int fill_hops(n4s_ctx_t *x, const int64_t *ids, const int *hops, int n,
-                     cbm_node_hop_t **out, int *out_count) {
+static int fill_hops(n4s_ctx_t *x, const int64_t *ids, const int *hops, int n, cbm_node_hop_t **out,
+                     int *out_count) {
     *out = NULL;
     *out_count = 0;
     cbm_node_hop_t *visited = calloc(n > 0 ? (size_t)n : 1, sizeof(cbm_node_hop_t));
@@ -784,8 +784,8 @@ static int op_bfs(void *ctx, const int64_t *seeds, int seed_count, bool multi,
         }
     }
     if (!multi && out->visited_count > 0 && max_edges != 0) {
-        rc = collect_bfs_edges(x, seeds[0], out->visited, out->visited_count, inbound,
-                               edge_types, edge_type_count, max_edges, out);
+        rc = collect_bfs_edges(x, seeds[0], out->visited, out->visited_count, inbound, edge_types,
+                               edge_type_count, max_edges, out);
     }
     return rc;
 }
@@ -976,8 +976,8 @@ int cbm_neo4j_native_query(const char *db_path, const char *project, const char 
     const char *kw = native_write_keyword(query);
     if (kw) {
         char msg[160];
-        (void)snprintf(msg, sizeof(msg),
-                       "native query_graph is read-only: '%s' is not allowed", kw);
+        (void)snprintf(msg, sizeof(msg), "native query_graph is read-only: '%s' is not allowed",
+                       kw);
         native_fail(out, msg);
         return -1;
     }

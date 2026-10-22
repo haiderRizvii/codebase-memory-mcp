@@ -10,9 +10,10 @@
 #include <stddef.h>
 
 typedef enum {
-    CBM_NEO4J_ATTACH_NONE = 0,     /* project is plain SQLite */
-    CBM_NEO4J_ATTACHED = 1,        /* graph reads now go to Neo4j */
-    CBM_NEO4J_ATTACH_FALLBACK = 2, /* Neo4j-backed, but unusable now: SQLite serves (err says why) */
+    CBM_NEO4J_ATTACH_NONE = 0, /* project is plain SQLite */
+    CBM_NEO4J_ATTACHED = 1,    /* graph reads now go to Neo4j */
+    CBM_NEO4J_ATTACH_FALLBACK =
+        2, /* Neo4j-backed, but unusable now: SQLite serves (err says why) */
 } cbm_neo4j_attach_t;
 
 /* If the project database at db_path is marked Neo4j-backed, connect and

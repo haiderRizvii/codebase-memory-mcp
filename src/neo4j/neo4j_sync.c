@@ -21,8 +21,9 @@
 
 /* Columns written explicitly; a flattened property never overwrites them. */
 static const char *const k_reserved_node_keys[] = {
-    "db",        "gen",        "project",  "id",       "label", "name", "qualified_name",
-    "file_path", "start_line", "end_line", "properties_json", NULL};
+    "db",         "gen",      "project",         "id",
+    "label",      "name",     "qualified_name",  "file_path",
+    "start_line", "end_line", "properties_json", NULL};
 static const char *const k_reserved_edge_keys[] = {"id", "type", "properties_json", NULL};
 
 static void sync_err(char *err, size_t err_sz, const char *what, const char *detail) {
@@ -73,8 +74,38 @@ int cbm_neo4j_sidecar_read(const char *db_path, cbm_neo4j_config_t *cfg, char *s
     return rc == 0 ? 0 : -1;
 }
 
+int cbm_neo4j_sidecar_field(const char *db_path, const char *key, char *out, size_t out_sz) {
+    char path[4096];
+    out[0] = '\0';
+    if (cbm_neo4j_sidecar_path(db_path, path, sizeof(path)) != 0) {
+        return -1;
+    }
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return -1;
+    }
+    char *buf = malloc(N4_SIDECAR_MAX + 1);
+    if (!buf) {
+        (void)fclose(f);
+        return -1;
+    }
+    size_t n = fread(buf, 1, N4_SIDECAR_MAX, f);
+    (void)fclose(f);
+    yyjson_doc *d = yyjson_read(buf, n, 0);
+    free(buf);
+    const char *v = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(d), key));
+    (void)snprintf(out, out_sz, "%s", v ? v : "");
+    yyjson_doc_free(d);
+    return 0;
+}
+
 int cbm_neo4j_sidecar_write(const char *db_path, const cbm_neo4j_config_t *cfg,
                             const char *synced_generation) {
+    return cbm_neo4j_sidecar_write_status(db_path, cfg, synced_generation, NULL);
+}
+
+int cbm_neo4j_sidecar_write_status(const char *db_path, const cbm_neo4j_config_t *cfg,
+                                   const char *synced_generation, const char *last_sync_error) {
     char path[4096];
     char tmp[4096 + 8];
     if (cbm_neo4j_sidecar_path(db_path, path, sizeof(path)) != 0) {
@@ -94,6 +125,10 @@ int cbm_neo4j_sidecar_write(const char *db_path, const cbm_neo4j_config_t *cfg,
     }
     yyjson_mut_obj_add_strcpy(d, yyjson_mut_doc_get_root(d), "synced_generation",
                               synced_generation ? synced_generation : "");
+    if (last_sync_error && last_sync_error[0]) {
+        yyjson_mut_obj_add_strcpy(d, yyjson_mut_doc_get_root(d), "last_sync_error",
+                                  last_sync_error);
+    }
     size_t len = 0;
     char *json = yyjson_mut_write(d, YYJSON_WRITE_PRETTY, &len);
     yyjson_mut_doc_free(d);
@@ -224,8 +259,7 @@ static void flatten_props(yyjson_mut_doc *d, yyjson_mut_val *obj, const char *js
                 all_num = all_num && yyjson_is_num(av);
             }
             if ((all_str || all_num) && first) {
-                yyjson_mut_obj_add(obj, yyjson_mut_strcpy(d, key),
-                                       yyjson_val_mut_copy(d, v));
+                yyjson_mut_obj_add(obj, yyjson_mut_strcpy(d, key), yyjson_val_mut_copy(d, v));
             }
         }
     }
@@ -263,7 +297,8 @@ static int stream_open_batch(n4_stream_t *s, const char *group) {
             (void)snprintf(cypher, sizeof(cypher),
                            "UNWIND $rows AS r CREATE (n:CbmNode:`%s`) SET n = r", group);
         } else {
-            (void)snprintf(cypher, sizeof(cypher), "UNWIND $rows AS r CREATE (n:CbmNode) SET n = r");
+            (void)snprintf(cypher, sizeof(cypher),
+                           "UNWIND $rows AS r CREATE (n:CbmNode) SET n = r");
         }
     } else {
         /* Types that are not plain identifiers land on CBM_EDGE with the real
@@ -316,10 +351,11 @@ static yyjson_mut_val *stream_row(n4_stream_t *s, const char *group) {
 
 static int sync_nodes(n4_stream_t *s, sqlite3 *db, char *err, size_t err_sz) {
     sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db,
-                           "SELECT id, project, label, name, qualified_name, file_path, start_line, "
-                           "end_line, properties FROM nodes ORDER BY label, id",
-                           -1, &st, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(
+            db,
+            "SELECT id, project, label, name, qualified_name, file_path, start_line, "
+            "end_line, properties FROM nodes ORDER BY label, id",
+            -1, &st, NULL) != SQLITE_OK) {
         sync_err(err, err_sz, "read nodes", sqlite3_errmsg(db));
         return -1;
     }
@@ -440,8 +476,16 @@ int cbm_neo4j_sync_db(cbm_neo4j_t *c, const char *db_path, const char *project,
         sync_err(err, err_sz, "read Neo4j project state", cbm_neo4j_error(c));
         goto fail;
     }
-    int64_t old_gen = cbm_neo4j_val_int(
-        cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0)), 0), 0);
+    /* The cleanup below deletes every generation except old_gen, so old_gen
+     * must be the published one: exactly one integer row, never a default. */
+    yyjson_val *gen_rows = cbm_neo4j_result_data(&r, 0);
+    yyjson_val *gen_val = cbm_neo4j_row_col(yyjson_arr_get_first(gen_rows), 0);
+    if (yyjson_arr_size(gen_rows) != 1 || !yyjson_is_int(gen_val)) {
+        cbm_neo4j_result_free(&r);
+        sync_err(err, err_sz, "read Neo4j project state", "unexpected generation reply");
+        goto fail;
+    }
+    int64_t old_gen = yyjson_get_sint(gen_val);
     cbm_neo4j_result_free(&r);
     int64_t new_gen = old_gen + 1;
 
@@ -557,6 +601,9 @@ int cbm_neo4j_after_publish(const char *db_path, const char *project,
     cbm_neo4j_config_t cfg;
     char synced[N4_GEN_MAX] = "";
     bool explicit_req = explicit_cfg != NULL;
+    /* True when a marker for this same target already exists: a failed sync
+     * is then recorded in it, so it stays visible after this run. */
+    bool marked_target = !explicit_req;
     if (explicit_req) {
         cfg = *explicit_cfg;
         /* Same target as last time: keep the recorded generation so an
@@ -567,6 +614,8 @@ int cbm_neo4j_after_publish(const char *db_path, const char *project,
                 0 ||
             strcmp(prev.uri, cfg.uri) != 0 || strcmp(prev.database, cfg.database) != 0) {
             synced[0] = '\0';
+        } else {
+            marked_target = true;
         }
         cbm_neo4j_config_wipe(&prev);
     } else {
@@ -610,8 +659,8 @@ int cbm_neo4j_after_publish(const char *db_path, const char *project,
         }
         if (result == 0 && !up_to_date) {
             char done_gen[N4_GEN_MAX] = "";
-            if (cbm_neo4j_sync_db(c, db_path, project, done_gen, sizeof(done_gen), err,
-                                  err_sz) != 0) {
+            if (cbm_neo4j_sync_db(c, db_path, project, done_gen, sizeof(done_gen), err, err_sz) !=
+                0) {
                 result = -1;
             } else {
                 (void)snprintf(synced, sizeof(synced), "%s", done_gen);
@@ -630,6 +679,12 @@ int cbm_neo4j_after_publish(const char *db_path, const char *project,
         }
     } else {
         cbm_log_error("neo4j.sync", "project", project, "err", err ? err : "");
+        /* Keep the last good synced_generation and record why this sync
+         * failed; the next successful sync rewrites the marker without it. */
+        if (marked_target) {
+            (void)cbm_neo4j_sidecar_write_status(db_path, &cfg, synced,
+                                                 err && err[0] ? err : "Neo4j sync failed");
+        }
     }
     cbm_neo4j_config_wipe(&cfg);
     /* An inherited (watcher / plain re-index) sync failure must not fail the

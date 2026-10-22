@@ -94,6 +94,12 @@ int cbm_neo4j_batch_run(cbm_neo4j_t *c, cbm_neo4j_batch_t *b, cbm_neo4j_result_t
 /* Convenience: one statement. params may be NULL; it must belong to b's doc,
  * so build it via cbm_neo4j_batch_add and run with cbm_neo4j_batch_run. */
 
+/* NULL when a 2xx body's "results" holds exactly one well-formed entry per
+ * statement ({"columns":[...], "data":[{"row":[one value per column]}]});
+ * otherwise a short description of the defect. cbm_neo4j_batch_run refuses
+ * any response this rejects, so a malformed reply is never "no rows". */
+const char *cbm_neo4j_result_shape_error(yyjson_val *results, int statements);
+
 /* Rows of statement i: array of {"row":[...]} objects, or NULL. */
 yyjson_val *cbm_neo4j_result_data(const cbm_neo4j_result_t *r, size_t stmt_index);
 /* Column j of a data entry. */
