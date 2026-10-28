@@ -31,4 +31,8 @@ cbm_neo4j_attach_t cbm_neo4j_store_attach(cbm_store_t *s, const char *db_path, c
 int cbm_neo4j_native_query(const char *db_path, const char *project, const char *query,
                            int max_rows, cbm_cypher_result_t *out);
 
+/* Tests: the Cypher cbm_store_list_files asks Neo4j first (File nodes only),
+ * so a test can check which index Neo4j plans it with. */
+const char *cbm_neo4j_test_list_file_nodes_cypher(void);
+
 #endif /* CBM_NEO4J_STORE_H */
