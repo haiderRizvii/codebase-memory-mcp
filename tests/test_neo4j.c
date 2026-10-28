@@ -994,6 +994,150 @@ TEST(neo4j_live_sync_and_read) {
     PASS();
 }
 
+/* search_code scans the files cbm_store_list_files names, so Neo4j must name
+ * exactly the files SQLite names -- and, for an ordinary index (one with File
+ * nodes), find them with the indexed File query alone instead of reading
+ * every node of the project. */
+typedef struct {
+    const char *label;
+    const char *name;
+    const char *path;
+} lf_node_t;
+
+typedef struct {
+    const char *project;
+    lf_node_t nodes[6];
+    const char *expected;
+    uint64_t queries;
+} lf_case_t;
+
+TEST(neo4j_live_list_files_matches_local) {
+    static const lf_case_t cases[] = {
+        /* An ordinary index: only File paths, even with code in a file that
+         * has no File node, a Folder, and a node without a path. */
+        {"lf-files",
+         {{"File", "a.c", "src/a.c"},
+          {"File", "b.c", "src/b.c"},
+          {"Function", "fa", "src/a.c"},
+          {"Function", "fgen", "src/gen.c"},
+          {"Folder", "src", "src"},
+          {"Function", "nopath", ""}},
+         "src/a.c,src/b.c,",
+         1},
+        /* No File nodes (an older graph): every non-Folder node path. */
+        {"lf-nofiles",
+         {{"Function", "one", "x/one.c"},
+          {"Function", "one2", "x/one.c"},
+          {"Function", "two", "x/two.c"},
+          {"Folder", "x", "x"}},
+         "x/one.c,x/two.c,",
+         2},
+        /* File nodes exist but name no path: nothing, as in SQLite. */
+        {"lf-emptyfile",
+         {{"File", "f", ""}, {"Function", "y", "y.c"}},
+         "",
+         2},
+    };
+    const char *uri = getenv("CBM_TEST_NEO4J_URI");
+    const char *pw = getenv("CBM_TEST_NEO4J_PASSWORD");
+    ASSERT_TRUE(uri && uri[0]);
+    clear_neo4j_env();
+    char *dir = th_mktempdir("cbm_n4_files");
+    ASSERT_NOT_NULL(dir);
+    cbm_neo4j_config_t cfg;
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_config_resolve(uri, NULL, pw, NULL, &cfg, err, sizeof(err)), 0);
+    cbm_neo4j_t *conn = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(conn);
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const lf_case_t *k = &cases[c];
+        /* A failed earlier run returns before its cleanup below. */
+        (void)cbm_neo4j_drop_project(conn, k->project, err, sizeof(err));
+        char db[512];
+        snprintf(db, sizeof(db), "%s/%s.db", dir, k->project);
+        cbm_store_t *s = cbm_store_open_path(db);
+        ASSERT_NOT_NULL(s);
+        cbm_store_upsert_project(s, k->project, dir);
+        for (size_t i = 0; i < sizeof(k->nodes) / sizeof(k->nodes[0]) && k->nodes[i].label; i++) {
+            char qn[128];
+            snprintf(qn, sizeof(qn), "%s.%s", k->project, k->nodes[i].name);
+            cbm_node_t n = {.project = k->project,
+                            .label = k->nodes[i].label,
+                            .name = k->nodes[i].name,
+                            .qualified_name = qn,
+                            .file_path = k->nodes[i].path,
+                            .start_line = 1,
+                            .end_line = 2,
+                            .properties_json = "{}"};
+            ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+        }
+        ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+        cbm_store_close(s);
+        ASSERT_EQ(cbm_neo4j_after_publish(db, k->project, &cfg, false, err, sizeof(err)), 0);
+
+        char sig[2][512];
+        for (int remote = 0; remote < 2; remote++) {
+            s = cbm_store_open_path_query(db);
+            ASSERT_NOT_NULL(s);
+            if (remote) {
+                ASSERT_EQ(cbm_neo4j_store_attach(s, db, k->project, err, sizeof(err)),
+                          CBM_NEO4J_ATTACHED);
+                cbm_store_backend_usage_reset(s);
+            }
+            char **files = NULL;
+            int nf = 0;
+            ASSERT_EQ(cbm_store_list_files(s, k->project, &files, &nf), CBM_STORE_OK);
+            size_t off = 0;
+            sig[remote][0] = '\0';
+            for (int i = 0; i < nf; i++) {
+                off += (size_t)snprintf(sig[remote] + off, sizeof(sig[remote]) - off, "%s,",
+                                        files[i]);
+                free(files[i]);
+            }
+            free(files);
+            if (remote) {
+                cbm_store_backend_usage_t usage;
+                cbm_store_backend_usage(s, &usage);
+                ASSERT_EQ(usage.remote_queries, k->queries);
+                ASSERT_EQ(usage.local_reads, 0);
+            }
+            cbm_store_close(s);
+        }
+        ASSERT_STR_EQ(sig[0], k->expected); /* SQLite */
+        ASSERT_STR_EQ(sig[1], sig[0]);      /* Neo4j answers the same */
+        if (c == 0) {
+            /* The File query must read File nodes through the label index.
+             * With the path test inside the MATCH, Neo4j chose the file_path
+             * index instead, which holds every node of the project. */
+            char explain[1024];
+            snprintf(explain, sizeof(explain), "EXPLAIN %s",
+                     cbm_neo4j_test_list_file_nodes_cypher());
+            cbm_neo4j_batch_t b;
+            ASSERT_EQ(cbm_neo4j_batch_init(&b), 0);
+            yyjson_mut_val *p = cbm_neo4j_batch_add(&b, explain);
+            yyjson_mut_obj_add_strcpy(b.doc, p, "db", k->project);
+            yyjson_mut_obj_add_int(b.doc, p, "gen", 1);
+            yyjson_mut_obj_add_strcpy(b.doc, p, "project", k->project);
+            cbm_neo4j_result_t r;
+            ASSERT_EQ(cbm_neo4j_batch_run(conn, &b, &r), 0);
+            yyjson_val *root =
+                yyjson_obj_get(yyjson_obj_get(yyjson_arr_get(r.results, 0), "plan"), "root");
+            const char *plan = yyjson_get_str(yyjson_obj_get(root, "string-representation"));
+            ASSERT_NOT_NULL(plan);
+            ASSERT_NOT_NULL(strstr(plan, "CbmNode(db, gen, label)"));
+            cbm_neo4j_result_free(&r);
+            cbm_neo4j_batch_free(&b);
+        }
+        ASSERT_EQ(cbm_neo4j_drop_project(conn, k->project, err, sizeof(err)), 0);
+    }
+
+    cbm_neo4j_close(conn);
+    cbm_neo4j_config_wipe(&cfg);
+    th_rmtree(dir);
+    PASS();
+}
+
 SUITE(neo4j) {
     RUN_TEST(neo4j_url_defaults);
     RUN_TEST(neo4j_url_port_path_ipv6);
@@ -1016,6 +1160,7 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_served_by_is_named_in_replies);
     if (live_neo4j_configured()) {
         RUN_TEST(neo4j_live_sync_and_read);
+        RUN_TEST(neo4j_live_list_files_matches_local);
     } else {
         printf("  (neo4j live test not registered: set CBM_TEST_NEO4J_URI and "
                "CBM_TEST_NEO4J_PASSWORD to run it against a server)\n");

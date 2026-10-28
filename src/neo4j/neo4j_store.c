@@ -977,20 +977,37 @@ static int op_neighbor_names(void *ctx, int64_t node_id, int limit, char ***call
     return rc;
 }
 
-static int op_list_files(void *ctx, const char *project, char ***out, int *count) {
-    n4s_ctx_t *x = ctx;
-    /* cbm_store_list_files: canonical File nodes, or -- for a graph without
-     * any -- every non-Folder node path. */
+/* The canonical File paths, through the (db, gen, label) index. The path test
+ * stays after the WITH: in the MATCH, "file_path IS NOT NULL" leads the
+ * planner to the (db, gen, file_path) index, which holds every node of the
+ * project, and the label filter then reads them all. (path <> '' is also
+ * false for a null path.) */
+static const char k_list_file_nodes[] =
+    "MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) "
+    "WHERE n.project = $project "
+    "WITH n.file_path AS path WHERE path <> '' "
+    "RETURN DISTINCT path ORDER BY path";
+
+const char *cbm_neo4j_test_list_file_nodes_cypher(void) {
+    return k_list_file_nodes;
+}
+
+/* The full cbm_store_list_files rule, for a graph without File paths. Its OR
+ * keeps Neo4j off the label index, so it reads every node of the project. */
+static const char k_list_node_paths[] =
+    "OPTIONAL MATCH (f:CbmNode {db: $db, gen: $gen, label: 'File'}) "
+    "WHERE f.project = $project "
+    "WITH count(f) > 0 AS has_files "
+    "MATCH (n:CbmNode {db: $db, gen: $gen}) "
+    "WHERE n.project = $project AND n.label <> 'Folder' "
+    "AND n.file_path IS NOT NULL AND n.file_path <> '' "
+    "AND (n.label = 'File' OR NOT has_files) "
+    "RETURN DISTINCT n.file_path AS path ORDER BY path";
+
+static int list_files_query(n4s_ctx_t *x, const char *cypher, const char *project, char ***out,
+                            int *count) {
     n4s_q_t q;
-    if (q_begin(x, &q,
-                "OPTIONAL MATCH (f:CbmNode {db: $db, gen: $gen, label: 'File'}) "
-                "WHERE f.project = $project "
-                "WITH count(f) > 0 AS has_files "
-                "MATCH (n:CbmNode {db: $db, gen: $gen}) "
-                "WHERE n.project = $project AND n.label <> 'Folder' "
-                "AND n.file_path IS NOT NULL AND n.file_path <> '' "
-                "AND (n.label = 'File' OR NOT has_files) "
-                "RETURN DISTINCT n.file_path AS path ORDER BY path") != 0) {
+    if (q_begin(x, &q, cypher) != 0) {
         return CBM_STORE_ERR;
     }
     q_str(&q, "project", project);
@@ -1001,6 +1018,22 @@ static int op_list_files(void *ctx, const char *project, char ***out, int *count
     int rc = collect_strings(&r, 0, out, count);
     cbm_neo4j_result_free(&r);
     return rc;
+}
+
+static int op_list_files(void *ctx, const char *project, char ***out, int *count) {
+    n4s_ctx_t *x = ctx;
+    /* cbm_store_list_files: canonical File nodes, or -- for a graph without
+     * any -- every non-Folder node path. Asking for File nodes first reads only
+     * those (reading every node of a 4.5M-node graph took over two minutes,
+     * and search_code waits on this list); the full rule runs only when that
+     * finds nothing, and then answers exactly as before. */
+    int rc = list_files_query(x, k_list_file_nodes, project, out, count);
+    if (rc != CBM_STORE_OK || *count > 0) {
+        return rc;
+    }
+    free(*out);
+    *out = NULL;
+    return list_files_query(x, k_list_node_paths, project, out, count);
 }
 
 /* Property keys the sync stores itself; never reported as graph properties. */
