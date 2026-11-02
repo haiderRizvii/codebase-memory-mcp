@@ -618,6 +618,210 @@ TEST(neo4j_rejects_malformed_2xx_bodies) {
     PASS();
 }
 
+/* A one-statement Neo4j response of n rows: ["dir/f<i>.c", {"i": i}] with
+ * columns path and props, or just the path when two_cols is false. */
+static char *big_body(int n, bool two_cols) {
+    size_t cap = (size_t)n * 64 + 256;
+    char *s = malloc(cap);
+    if (!s) {
+        return NULL;
+    }
+    size_t len = (size_t)snprintf(s, cap, "{\"results\":[{\"columns\":[%s],\"data\":[",
+                                  two_cols ? "\"path\",\"props\"" : "\"path\"");
+    for (int i = 0; i < n; i++) {
+        if (two_cols) {
+            len += (size_t)snprintf(s + len, cap - len,
+                                    "%s{\"row\":[\"dir/f%07d.c\",{\"i\":%d}],\"meta\":[null,null]}",
+                                    i ? "," : "", i, i);
+        } else {
+            len += (size_t)snprintf(s + len, cap - len,
+                                    "%s{\"row\":[\"dir/f%07d.c\"],\"meta\":[null]}", i ? "," : "",
+                                    i);
+        }
+    }
+    (void)snprintf(s + len, cap - len, "]}],\"errors\":[]}");
+    return s;
+}
+
+TEST(neo4j_large_results_are_read_in_linear_time) {
+    /* Rows are objects, so reading row i by index steps through every row
+     * before it. search_code lists all of a project's files (272k on the
+     * production graph) and spent 86 s there before any grep ran. In a
+     * benchmark the old way took 12 s for 100k rows and 156 s for 272k; the
+     * iterator takes milliseconds. The bound is loose enough for a slow CI
+     * machine and far below the quadratic cost of 200k rows. */
+    enum { N = 200000, BOUND_MS = 3000 };
+    char *body = big_body(N, false);
+    ASSERT_NOT_NULL(body);
+    char **files = NULL;
+    int nf = 0;
+    uint64_t t0 = cbm_now_ms();
+    ASSERT_EQ(cbm_neo4j_test_column_strings(body, &files, &nf), CBM_STORE_OK);
+    uint64_t list_ms = cbm_now_ms() - t0;
+    free(body);
+    ASSERT_EQ(nf, N);
+    char want[32];
+    for (int i = 0; i < nf; i++) {
+        snprintf(want, sizeof(want), "dir/f%07d.c", i);
+        ASSERT_STR_EQ(files[i], want); /* every row, in order */
+        free(files[i]);
+    }
+    free(files);
+    ASSERT_LT(list_ms, BOUND_MS);
+
+    /* query_graph's native rows: same walk, two columns, a map value, and the
+     * 100000-row cap when max_rows is 0. */
+    body = big_body(N, true);
+    ASSERT_NOT_NULL(body);
+    cbm_cypher_result_t r;
+    t0 = cbm_now_ms();
+    ASSERT_EQ(cbm_neo4j_test_native_rows(body, 0, &r), 0);
+    uint64_t native_ms = cbm_now_ms() - t0;
+    ASSERT_EQ(r.col_count, 2);
+    ASSERT_STR_EQ(r.columns[0], "path");
+    ASSERT_STR_EQ(r.columns[1], "props");
+    ASSERT_EQ(r.row_count, 100000);
+    ASSERT_TRUE(r.truncated);
+    for (int i = 0; i < r.row_count; i += 9999) {
+        snprintf(want, sizeof(want), "dir/f%07d.c", i);
+        ASSERT_STR_EQ(r.rows[i][0], want);
+    }
+    ASSERT_STR_EQ(r.rows[99999][0], "dir/f0099999.c");
+    ASSERT_STR_EQ(r.rows[99999][1], "{\"i\":99999}");
+    cbm_cypher_result_free(&r);
+    ASSERT_LT(native_ms, BOUND_MS);
+
+    /* A small max_rows keeps the first rows only. */
+    ASSERT_EQ(cbm_neo4j_test_native_rows(body, 3, &r), 0);
+    free(body);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_TRUE(r.truncated);
+    ASSERT_STR_EQ(r.rows[2][0], "dir/f0000002.c");
+    cbm_cypher_result_free(&r);
+    PASS();
+}
+
+TEST(neo4j_chunked_body_decodes_across_any_split) {
+    /* Two chunks, a zero chunk with a trailer, then the next response's
+     * first bytes (keep-alive surplus that must stay intact). */
+    static const char raw[] = "5\r\nhello\r\n"
+                              "7;ext=1\r\n, world\r\n"
+                              "0\r\nX-T: 1\r\n\r\n"
+                              "HTTP/1.1";
+    const size_t raw_len = sizeof(raw) - 1;
+    const size_t body_len = raw_len - strlen("HTTP/1.1");
+    for (size_t step = 1; step <= raw_len; step++) {
+        char *out = NULL;
+        size_t out_len = 0;
+        size_t consumed = 0;
+        size_t buffered = 0;
+        ASSERT_EQ(
+            cbm_neo4j_test_dechunk(raw, raw_len, step, &out, &out_len, &consumed, &buffered), 0);
+        ASSERT_EQ(out_len, 12);
+        ASSERT_EQ(memcmp(out, "hello, world", 12), 0);
+        ASSERT_EQ(consumed, body_len);
+        /* Whatever of the next response already arrived is untouched. */
+        ASSERT_TRUE(buffered >= consumed && buffered <= raw_len);
+        ASSERT_EQ(memcmp(out + consumed, raw + consumed, buffered - consumed), 0);
+        free(out);
+    }
+    /* Cut anywhere before the final empty line: truncated, never a body. */
+    for (size_t cut = 0; cut < body_len; cut++) {
+        char *out = NULL;
+        size_t out_len = 0;
+        size_t consumed = 0;
+        size_t buffered = 0;
+        ASSERT_EQ(cbm_neo4j_test_dechunk(raw, cut, 3, &out, &out_len, &consumed, &buffered), 1);
+    }
+    char *out = NULL;
+    size_t out_len = 0;
+    size_t consumed = 0;
+    size_t buffered = 0;
+    ASSERT_EQ(cbm_neo4j_test_dechunk("zz\r\nab\r\n0\r\n\r\n", 14, 4, &out, &out_len, &consumed,
+                                     &buffered),
+              -1);
+    /* A chunk size larger than anything that could follow is "need more",
+     * never an overflowed bounds check. */
+    ASSERT_EQ(cbm_neo4j_test_dechunk("ffffffffffffffff\r\nab", 20, 5, &out, &out_len, &consumed,
+                                     &buffered),
+              1);
+
+    /* A 48 MB body in 8 KB chunks read 16 KB at a time, through the same
+     * read loop the socket uses. Copying and decoding the whole body again
+     * after every read would move ~150 GB here; now each byte moves once. */
+    enum { CHUNK = 8192, CHUNKS = 6000, STEP = 16384, BOUND_MS = 3000 };
+    size_t big_len = (size_t)CHUNKS * (CHUNK + 10) + 16;
+    char *big = malloc(big_len);
+    ASSERT_NOT_NULL(big);
+    size_t n = 0;
+    for (int c = 0; c < CHUNKS; c++) {
+        n += (size_t)snprintf(big + n, big_len - n, "%x\r\n", CHUNK);
+        memset(big + n, 'a' + c % 26, CHUNK);
+        n += CHUNK;
+        big[n++] = '\r';
+        big[n++] = '\n';
+    }
+    memcpy(big + n, "0\r\n\r\n", 5);
+    n += 5;
+    uint64_t t0 = cbm_now_ms();
+    ASSERT_EQ(cbm_neo4j_test_dechunk(big, n, STEP, &out, &out_len, &consumed, &buffered), 0);
+    uint64_t ms = cbm_now_ms() - t0;
+    ASSERT_EQ(out_len, (size_t)CHUNKS * CHUNK);
+    ASSERT_EQ(consumed, n);
+    for (int c = 0; c < CHUNKS; c += 97) {
+        ASSERT_EQ(out[(size_t)c * CHUNK], 'a' + c % 26);
+        ASSERT_EQ(out[(size_t)c * CHUNK + CHUNK - 1], 'a' + c % 26);
+    }
+    free(out);
+    free(big);
+    ASSERT_LT(ms, BOUND_MS);
+    PASS();
+}
+
+TEST(neo4j_row_conversion_edge_cases) {
+    char **files = NULL;
+    int nf = -1;
+    /* No rows: success, nothing allocated. */
+    ASSERT_EQ(cbm_neo4j_test_column_strings("{\"results\":[{\"columns\":[\"p\"],\"data\":[]}],"
+                                            "\"errors\":[]}",
+                                            &files, &nf),
+              CBM_STORE_OK);
+    ASSERT_EQ(nf, 0);
+    ASSERT_NULL(files);
+    /* null and non-string cells: "" and the JSON text, as before. */
+    ASSERT_EQ(cbm_neo4j_test_column_strings("{\"results\":[{\"columns\":[\"p\"],\"data\":["
+                                            "{\"row\":[null]},{\"row\":[7]},{\"row\":[\"a\"]}]}],"
+                                            "\"errors\":[]}",
+                                            &files, &nf),
+              CBM_STORE_OK);
+    ASSERT_EQ(nf, 3);
+    ASSERT_STR_EQ(files[0], "");
+    ASSERT_STR_EQ(files[1], "7");
+    ASSERT_STR_EQ(files[2], "a");
+    for (int i = 0; i < nf; i++) {
+        free(files[i]);
+    }
+    free(files);
+    /* Native rows print null as "null". */
+    cbm_cypher_result_t r;
+    ASSERT_EQ(cbm_neo4j_test_native_rows("{\"results\":[{\"columns\":[\"a\",\"b\"],\"data\":["
+                                         "{\"row\":[null,[1,2]]}]}],\"errors\":[]}",
+                                         0, &r),
+              0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_FALSE(r.truncated);
+    ASSERT_STR_EQ(r.rows[0][0], "null");
+    ASSERT_STR_EQ(r.rows[0][1], "[1,2]");
+    cbm_cypher_result_free(&r);
+    /* A body the client would refuse is refused here too. */
+    ASSERT_EQ(cbm_neo4j_test_column_strings("{\"results\":[{\"data\":[]}]}", &files, &nf),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_neo4j_test_native_rows("not json", 0, &r), -1);
+    ASSERT_NOT_NULL(r.error);
+    cbm_cypher_result_free(&r);
+    PASS();
+}
+
 TEST(neo4j_request_with_invalid_utf8_is_still_sent) {
     /* A docstring from a Latin-1 source file ("Copyright \xa9 2004") is not
      * UTF-8. It used to fail the whole sync with "failed to serialize Neo4j
@@ -1138,6 +1342,323 @@ TEST(neo4j_live_list_files_matches_local) {
     PASS();
 }
 
+TEST(neo4j_live_large_file_list_matches_local) {
+    /* The whole path search_code's scope step takes -- store open, attach,
+     * cbm_store_list_files over HTTP -- on 100k files, plus native query_graph
+     * over as many rows. Neo4j must return exactly SQLite's list, and quickly:
+     * reading the rows used to take 12 s for 100k in a benchmark. */
+    enum { N = 100000, BOUND_MS = 10000 };
+    static const char project[] = "lf-large";
+    const char *uri = getenv("CBM_TEST_NEO4J_URI");
+    const char *pw = getenv("CBM_TEST_NEO4J_PASSWORD");
+    ASSERT_TRUE(uri && uri[0]);
+    clear_neo4j_env();
+    char *dir = th_mktempdir("cbm_n4_large");
+    ASSERT_NOT_NULL(dir);
+    cbm_neo4j_config_t cfg;
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_config_resolve(uri, NULL, pw, NULL, &cfg, err, sizeof(err)), 0);
+    cbm_neo4j_t *conn = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(conn);
+    (void)cbm_neo4j_drop_project(conn, project, err, sizeof(err));
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/%s.db", dir, project);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, project, dir);
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    for (int i = 0; i < N; i++) {
+        char name[32];
+        char qn[64];
+        char path[64];
+        /* Descending, so the sorted list is not simply insertion order. */
+        snprintf(name, sizeof(name), "f%07d.c", N - 1 - i);
+        snprintf(qn, sizeof(qn), "%s.%s", project, name);
+        snprintf(path, sizeof(path), "d%02d/%s", i % 37, name);
+        cbm_node_t n = {.project = project,
+                        .label = "File",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = path,
+                        .start_line = 1,
+                        .end_line = 1,
+                        .properties_json = "{}"};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    }
+    ASSERT_EQ(cbm_store_commit(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_EQ(cbm_neo4j_after_publish(db, project, &cfg, false, err, sizeof(err)), 0);
+
+    char **local = NULL;
+    int nlocal = 0;
+    s = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_list_files(s, project, &local, &nlocal), CBM_STORE_OK);
+    cbm_store_close(s);
+    ASSERT_EQ(nlocal, N);
+
+    uint64_t t0 = cbm_now_ms();
+    s = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_neo4j_store_attach(s, db, project, err, sizeof(err)), CBM_NEO4J_ATTACHED);
+    char **remote = NULL;
+    int nremote = 0;
+    ASSERT_EQ(cbm_store_list_files(s, project, &remote, &nremote), CBM_STORE_OK);
+    uint64_t list_ms = cbm_now_ms() - t0;
+    cbm_store_close(s);
+    ASSERT_EQ(nremote, nlocal);
+    for (int i = 0; i < nlocal; i++) {
+        ASSERT_STR_EQ(remote[i], local[i]);
+        free(remote[i]);
+    }
+    free(remote);
+    printf("  [lf-large] %d files listed from Neo4j in %llu ms\n", N, (unsigned long long)list_ms);
+    ASSERT_LT(list_ms, BOUND_MS);
+
+    cbm_cypher_result_t r;
+    t0 = cbm_now_ms();
+    ASSERT_EQ(cbm_neo4j_native_query(db, project,
+                                     "MATCH (n:CbmNode {db: $db, gen: $gen, label: 'File'}) "
+                                     "RETURN n.file_path AS path ORDER BY path",
+                                     0, &r),
+              0);
+    uint64_t native_ms = cbm_now_ms() - t0;
+    ASSERT_EQ(r.row_count, N);
+    for (int i = 0; i < N; i++) {
+        ASSERT_STR_EQ(r.rows[i][0], local[i]);
+        free(local[i]);
+    }
+    free(local);
+    cbm_cypher_result_free(&r);
+    printf("  [lf-large] %d native rows in %llu ms\n", N, (unsigned long long)native_ms);
+    ASSERT_LT(native_ms, BOUND_MS);
+
+    ASSERT_EQ(cbm_neo4j_drop_project(conn, project, err, sizeof(err)), 0);
+    cbm_neo4j_close(conn);
+    cbm_neo4j_config_wipe(&cfg);
+    th_rmtree(dir);
+    PASS();
+}
+
+/* ── query_graph's engine dialect scoped for Neo4j ─────────────────── */
+
+/* 0 when the query scopes to want (NULL: is refused with a reason). */
+static int scope_expect(const char *in, const char *want) {
+    char why[128];
+    char *got = cbm_neo4j_scope_query(in, why, sizeof(why));
+    if (!want) {
+        if (got) {
+            printf("  scope(%s) = %s, want refusal\n", in, got);
+            free(got);
+            return 1;
+        }
+        ASSERT_TRUE(why[0] != '\0');
+        return 0;
+    }
+    if (!got || strcmp(got, want) != 0) {
+        printf("  scope(%s)\n    got  %s\n    want %s\n", in, got ? got : "(null)", want);
+        free(got);
+        return 1;
+    }
+    free(got);
+    return 0;
+}
+#define SCOPE_EXPECT(in, want) ASSERT_EQ(scope_expect(in, want), 0)
+
+TEST(neo4j_scope_query_scopes_every_node_pattern) {
+    SCOPE_EXPECT("MATCH (n) RETURN count(n)",
+                 "MATCH (n:CbmNode {db: $db, gen: $gen}) RETURN count(n)");
+    SCOPE_EXPECT("MATCH ()-[r:CALLS]->() RETURN count(r)",
+                 "MATCH (:CbmNode {db: $db, gen: $gen})-[r:CALLS]->(:CbmNode {db: $db, gen: $gen}) "
+                 "RETURN count(r)");
+    SCOPE_EXPECT("MATCH (a:Function {name: 'x'})<-[:CALLS]-(b) RETURN b.name",
+                 "MATCH (a:CbmNode:Function {db: $db, gen: $gen, name: 'x'})<-[:CALLS]-"
+                 "(b:CbmNode {db: $db, gen: $gen}) RETURN b.name");
+    SCOPE_EXPECT("MATCH (a), (b:File|Folder) RETURN a",
+                 "MATCH (a:CbmNode {db: $db, gen: $gen}), "
+                 "(b:CbmNode&(File|Folder) {db: $db, gen: $gen}) RETURN a");
+    SCOPE_EXPECT("MATCH (n {}) RETURN n", "MATCH (n :CbmNode {db: $db, gen: $gen}) RETURN n");
+    SCOPE_EXPECT("MATCH (a) OPTIONAL MATCH (a)-[:USAGE]->(u) RETURN a.name, u.name",
+                 "MATCH (a:CbmNode {db: $db, gen: $gen}) OPTIONAL MATCH "
+                 "(a:CbmNode {db: $db, gen: $gen})-[:USAGE]->(u:CbmNode {db: $db, gen: $gen}) "
+                 "RETURN a.name, u.name");
+    /* a pattern predicate in WHERE is a pattern too; a call is not */
+    SCOPE_EXPECT("MATCH (a) WHERE NOT (a)<-[:CALLS]-() RETURN count(a)",
+                 "MATCH (a:CbmNode {db: $db, gen: $gen}) WHERE NOT "
+                 "(a:CbmNode {db: $db, gen: $gen})<-[:CALLS]-(:CbmNode {db: $db, gen: $gen}) "
+                 "RETURN count(a)");
+    /* parentheses inside string literals are text */
+    SCOPE_EXPECT("MATCH (n) WHERE n.name = '(x)' RETURN n",
+                 "MATCH (n:CbmNode {db: $db, gen: $gen}) WHERE n.name = '(x)' RETURN n");
+    SCOPE_EXPECT("MATCH (n:A:B|C) RETURN n", NULL);
+    /* engine-only virtual properties have no Neo4j value */
+    SCOPE_EXPECT("MATCH (n:Function) WHERE n.in_degree = '0' RETURN n.name", NULL);
+    SCOPE_EXPECT("RETURN 1", NULL);
+    PASS();
+}
+
+/* Rows of a query, one line each, for comparing two stores' answers. */
+static void cypher_signature(cbm_store_t *s, const char *q, char *buf, size_t sz) {
+    cbm_cypher_result_t r;
+    int rc = cbm_cypher_execute(s, q, "lv2", 0, &r);
+    size_t off = (size_t)snprintf(buf, sz, "rc=%d err=%s rows=%d:", rc, r.error ? r.error : "",
+                                  r.row_count);
+    for (int i = 0; i < r.row_count && off < sz; i++) {
+        for (int j = 0; j < r.col_count && off < sz; j++) {
+            off += (size_t)snprintf(buf + off, sz - off, "%s|", r.rows[i][j]);
+        }
+        if (off < sz) {
+            off += (size_t)snprintf(buf + off, sz - off, ";");
+        }
+    }
+    cbm_cypher_result_free(&r);
+}
+
+/* A hub with many callers, answered by the engine over Neo4j (prefetched
+ * edges, paged scans, batched reads) exactly as over the local index, in a
+ * handful of round trips instead of one per edge and neighbour. */
+TEST(neo4j_live_engine_reads_match_local) {
+    const char *uri = getenv("CBM_TEST_NEO4J_URI");
+    const char *pw = getenv("CBM_TEST_NEO4J_PASSWORD");
+    ASSERT_TRUE(uri && uri[0]);
+    clear_neo4j_env();
+    char *dir = th_mktempdir("cbm_n4_lv2");
+    ASSERT_NOT_NULL(dir);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/lv2.db", dir);
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "lv2", dir);
+    enum { CALLERS = 1200 };
+    static int64_t ids[CALLERS + 2];
+    cbm_node_t hub = {.project = "lv2", .label = "Function", .name = "h",
+                      .qualified_name = "lv2.h", .file_path = "h.c", .start_line = 1,
+                      .end_line = 2, .properties_json = "{}"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    cbm_node_t var = {.project = "lv2", .label = "Variable", .name = "g",
+                      .qualified_name = "lv2.g", .file_path = "h.c", .start_line = 3,
+                      .end_line = 3, .properties_json = "{}"};
+    int64_t var_id = cbm_store_upsert_node(s, &var);
+    for (int i = 0; i < CALLERS; i++) {
+        char name[32];
+        char qn[48];
+        char file[32];
+        snprintf(name, sizeof(name), "c%04d", i);
+        snprintf(qn, sizeof(qn), "lv2.%s", name);
+        snprintf(file, sizeof(file), "f%03d.c", i / 10);
+        cbm_node_t n = {.project = "lv2", .label = "Function", .name = name, .qualified_name = qn,
+                        .file_path = file, .start_line = 1 + i % 10, .end_line = 1 + i % 10,
+                        .properties_json = "{}"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        cbm_edge_t e = {.project = "lv2", .source_id = ids[i], .target_id = hub_id,
+                        .type = "CALLS", .properties_json = "{}"};
+        cbm_store_insert_edge(s, &e);
+        if (i % 100 == 0) {
+            cbm_edge_t u = {.project = "lv2", .source_id = ids[i], .target_id = var_id,
+                            .type = "USAGE", .properties_json = "{}"};
+            cbm_store_insert_edge(s, &u);
+        }
+    }
+    ASSERT_EQ(cbm_store_generation_advance(s), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    cbm_neo4j_config_t cfg;
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_config_resolve(uri, NULL, pw, NULL, &cfg, err, sizeof(err)), 0);
+    ASSERT_EQ(cbm_neo4j_after_publish(db, "lv2", &cfg, false, err, sizeof(err)), 0);
+    cbm_store_t *local = cbm_store_open_path_query(db);
+    cbm_store_t *remote = cbm_store_open_path_query(db);
+    ASSERT_NOT_NULL(local);
+    ASSERT_NOT_NULL(remote);
+    ASSERT_EQ(cbm_neo4j_store_attach(remote, db, "lv2", err, sizeof(err)), CBM_NEO4J_ATTACHED);
+    cbm_store_test_set_remote_scan_page(97); /* many short pages */
+
+    static const char *const queries[] = {
+        "MATCH (n) RETURN count(n)",
+        "MATCH (n) RETURN n.file_path, n.name",
+        "MATCH (n:Function) RETURN n.name ORDER BY n.name DESC LIMIT 7",
+        "MATCH (a)-[:CALLS]->(b {name: 'h'}) RETURN count(a)",
+        "MATCH (a:Function)-[:CALLS]->(b:Function) RETURN b.name, count(a) AS c ORDER BY c DESC",
+        "MATCH (h {name: 'h'})<-[:CALLS]-(c) RETURN c.name, c.file_path ORDER BY c.name LIMIT 9",
+        "MATCH (a)-[r]-(b {name: 'h'}) RETURN count(r)",
+        "MATCH (a:Function) OPTIONAL MATCH (a)-[:USAGE]->(u) RETURN a.name, u.name "
+        "ORDER BY a.name LIMIT 30",
+        "MATCH (a)-[:USAGE]->(v:Variable) RETURN a.name ORDER BY a.name",
+        NULL};
+    static char want[1 << 16];
+    static char got[1 << 16];
+    for (int i = 0; queries[i]; i++) {
+        cypher_signature(local, queries[i], want, sizeof(want));
+        cypher_signature(remote, queries[i], got, sizeof(got));
+        if (strcmp(want, got) != 0) {
+            printf("  query: %s\n   local:  %.300s\n   neo4j:  %.300s\n", queries[i], want, got);
+        }
+        ASSERT_STR_EQ(got, want);
+    }
+
+    /* The hub's callers: a few round trips, not one per caller. */
+    cbm_store_backend_usage_reset(remote);
+    cypher_signature(remote, "MATCH (a)-[:CALLS]->(b {name: 'h'}) RETURN count(a)", got,
+                     sizeof(got));
+    cbm_store_backend_usage_t usage;
+    cbm_store_backend_usage(remote, &usage);
+    printf("  [lv2] hub callers counted in %llu Neo4j queries\n",
+           (unsigned long long)usage.remote_queries);
+    ASSERT_TRUE(usage.remote_queries < 60);
+
+    /* Batched reads agree with the local index. */
+    cbm_node_t *a = NULL;
+    cbm_node_t *b = NULL;
+    int na = 0;
+    int nb = 0;
+    int64_t pick[4] = {ids[5], hub_id, -12345, ids[CALLERS - 1]};
+    ASSERT_EQ(cbm_store_find_nodes_by_ids(local, pick, 4, &a, &na), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_nodes_by_ids(remote, pick, 4, &b, &nb), CBM_STORE_OK);
+    ASSERT_EQ(na, 3);
+    ASSERT_EQ(nb, na);
+    for (int i = 0; i < na; i++) {
+        ASSERT_EQ(b[i].id, a[i].id);
+        ASSERT_STR_EQ(b[i].qualified_name, a[i].qualified_name);
+    }
+    cbm_store_free_nodes(a, na);
+    cbm_store_free_nodes(b, nb);
+    const char *files[3] = {"f007.c", "nope.c", "h.c"};
+    ASSERT_EQ(cbm_store_find_nodes_by_files(local, "lv2", files, 3, &a, &na), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_nodes_by_files(remote, "lv2", files, 3, &b, &nb), CBM_STORE_OK);
+    ASSERT_EQ(na, 12);
+    ASSERT_EQ(nb, na);
+    for (int i = 0; i < na; i++) {
+        ASSERT_EQ(b[i].id, a[i].id);
+        ASSERT_STR_EQ(b[i].file_path, a[i].file_path);
+    }
+    cbm_store_free_nodes(a, na);
+    cbm_store_free_nodes(b, nb);
+
+    /* The scoped native form of an engine query answers the same count. */
+    char *scoped = cbm_neo4j_scope_query("MATCH (a)-[:CALLS]->(b {name: 'h'}) RETURN count(a)",
+                                         err, sizeof(err));
+    ASSERT_NOT_NULL(scoped);
+    cbm_cypher_result_t r;
+    ASSERT_EQ(cbm_neo4j_native_query(db, "lv2", scoped, 0, &r), 0);
+    free(scoped);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "1200");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_test_set_remote_scan_page(0);
+    cbm_store_close(local);
+    cbm_store_close(remote);
+    cbm_neo4j_t *conn = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(conn);
+    ASSERT_EQ(cbm_neo4j_drop_project(conn, "lv2", err, sizeof(err)), 0);
+    cbm_neo4j_close(conn);
+    cbm_neo4j_config_wipe(&cfg);
+    th_rmtree(dir);
+    PASS();
+}
+
 SUITE(neo4j) {
     RUN_TEST(neo4j_url_defaults);
     RUN_TEST(neo4j_url_port_path_ipv6);
@@ -1151,6 +1672,9 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_store_remote_routing);
     RUN_TEST(neo4j_native_query_is_read_only);
     RUN_TEST(neo4j_rejects_malformed_2xx_bodies);
+    RUN_TEST(neo4j_large_results_are_read_in_linear_time);
+    RUN_TEST(neo4j_row_conversion_edge_cases);
+    RUN_TEST(neo4j_chunked_body_decodes_across_any_split);
     RUN_TEST(neo4j_request_with_invalid_utf8_is_still_sent);
     RUN_TEST(neo4j_sidecar_records_last_sync_error);
     RUN_TEST(neo4j_unavailable_graph_read_is_an_error);
@@ -1158,9 +1682,12 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_routed_lookups_apply_local_predicates);
     RUN_TEST(neo4j_marker_found_for_renamed_database);
     RUN_TEST(neo4j_served_by_is_named_in_replies);
+    RUN_TEST(neo4j_scope_query_scopes_every_node_pattern);
     if (live_neo4j_configured()) {
         RUN_TEST(neo4j_live_sync_and_read);
         RUN_TEST(neo4j_live_list_files_matches_local);
+        RUN_TEST(neo4j_live_large_file_list_matches_local);
+        RUN_TEST(neo4j_live_engine_reads_match_local);
     } else {
         printf("  (neo4j live test not registered: set CBM_TEST_NEO4J_URI and "
                "CBM_TEST_NEO4J_PASSWORD to run it against a server)\n");

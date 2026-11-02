@@ -3475,6 +3475,130 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
                               project, file_path, out, count);
 }
 
+/* ── Batched reads (see store.h) ─────────────────────────────────── */
+
+int cbm_store_prefetch_edges(cbm_store_t *s, const int64_t *ids, int n, bool by_target,
+                             const char *const *types, int type_count) {
+    if (s && s->remote_ops && s->remote_ops->prefetch_edges && ids && n > 0) {
+        /* A failed prefetch only means the reads go one by one. */
+        int rc =
+            s->remote_ops->prefetch_edges(s->remote_ctx, ids, n, by_target, types, type_count);
+        if (rc == CBM_STORE_SCAN_LIMIT) {
+            return rc;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+void cbm_store_prefetch_clear(cbm_store_t *s) {
+    if (s && s->remote_ops && s->remote_ops->cache_clear) {
+        s->remote_ops->cache_clear(s->remote_ctx);
+    }
+}
+
+/* Append src[0..n) to *arr (growing *cap), taking ownership of the rows. */
+static int nodes_append(cbm_node_t **arr, int *count, int *cap, cbm_node_t *src, int n) {
+    if (n <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (*count > INT_MAX - n) {
+        return CBM_STORE_ERR;
+    }
+    if (*count + n > *cap) {
+        int next = *cap > 0 ? *cap : 64;
+        while (next < *count + n) {
+            next = next > INT_MAX / 2 ? INT_MAX : next * 2;
+        }
+        cbm_node_t *grown = realloc(*arr, (size_t)next * sizeof(cbm_node_t));
+        if (!grown) {
+            return CBM_STORE_ERR;
+        }
+        *arr = grown;
+        *cap = next;
+    }
+    memcpy(*arr + *count, src, (size_t)n * sizeof(cbm_node_t));
+    *count += n;
+    return CBM_STORE_OK;
+}
+
+static int cmp_node_by_id(const void *a, const void *b) {
+    int64_t x = ((const cbm_node_t *)a)->id;
+    int64_t y = ((const cbm_node_t *)b)->id;
+    return (x > y) - (x < y);
+}
+
+int cbm_store_find_nodes_by_ids(cbm_store_t *s, const int64_t *ids, int n, cbm_node_t **out,
+                                int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    if (n <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (s->remote_ops && s->remote_ops->find_nodes_by_ids) {
+        return remote_status(s, s->remote_ops->find_nodes_by_ids(s->remote_ctx, ids, n, out, count));
+    }
+    cbm_node_t *arr = malloc((size_t)n * sizeof(cbm_node_t));
+    if (!arr) {
+        return CBM_STORE_ERR;
+    }
+    int got = 0;
+    for (int i = 0; i < n; i++) {
+        int rc = cbm_store_find_node_by_id(s, ids[i], &arr[got]);
+        if (rc == CBM_STORE_OK) {
+            got++;
+        } else if (rc != CBM_STORE_NOT_FOUND) {
+            cbm_store_free_nodes(arr, got);
+            return rc;
+        }
+    }
+    if (got > 1) {
+        qsort(arr, (size_t)got, sizeof(cbm_node_t), cmp_node_by_id);
+    }
+    *out = arr;
+    *count = got;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_find_nodes_by_files(cbm_store_t *s, const char *project, const char *const *files,
+                                  int n, cbm_node_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    if (n <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (s->remote_ops && s->remote_ops->find_nodes_by_files) {
+        return remote_status(
+            s, s->remote_ops->find_nodes_by_files(s->remote_ctx, project, files, n, out, count));
+    }
+    cbm_node_t *arr = NULL;
+    int got = 0;
+    int cap = 0;
+    for (int i = 0; i < n; i++) {
+        cbm_node_t *part = NULL;
+        int pc = 0;
+        int rc = cbm_store_find_nodes_by_file(s, project, files[i], &part, &pc);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_nodes(arr, got);
+            return rc;
+        }
+        if (nodes_append(&arr, &got, &cap, part, pc) != CBM_STORE_OK) {
+            cbm_store_free_nodes(part, pc);
+            cbm_store_free_nodes(arr, got);
+            return CBM_STORE_ERR;
+        }
+        free(part); /* rows now owned by arr */
+    }
+    *out = arr;
+    *count = got;
+    return CBM_STORE_OK;
+}
+
 /* ── Streamed node scan ──────────────────────────────────────────────
  * cbm_store_find_nodes / cbm_store_find_nodes_by_label materialise every row
  * at once: 8.5 M kernel nodes with all their strings are 4.9 GB before the
@@ -3533,6 +3657,14 @@ struct cbm_store_node_scan {
     cbm_node_t *eager; /* fallback: the eager scan's rows, handed out in order */
     int eager_count;
     int eager_next;
+    /* Remote backend with a paged scan op: keyset pages (after_file, last_id)
+     * so a scan of a huge graph can stop between pages. */
+    bool remote_paged;
+    char *after_file;
+    cbm_node_t *rbuf; /* remote page not yet handed out: rbuf[rbuf_next..rbuf_count) */
+    int rbuf_count;
+    int rbuf_next;
+    bool remote_done; /* the backend has no rows after rbuf */
 };
 
 #ifdef CBM_ENABLE_TEST_SEAMS
@@ -3580,7 +3712,10 @@ cbm_store_node_scan_t *cbm_store_node_scan_open(cbm_store_t *s, const char *proj
         return NULL;
     }
     scan->phase = label ? NODE_SCAN_LABEL : NODE_SCAN_NULL_FILE; /* NULL file_path rows first */
-    if (s->remote_ops) {
+    if (s->remote_ops && s->remote_ops->scan_nodes) {
+        scan->paged = true;
+        scan->remote_paged = true;
+    } else if (s->remote_ops) {
         scan->paged = false; /* the remote backend answers the eager query */
     } else if (label) {
         scan->paged =
@@ -3637,7 +3772,82 @@ static void node_scan_bind(cbm_store_node_scan_t *scan, sqlite3_stmt *stmt, node
 
 /* One page of the current phase into out[0..max). A short page ends the
  * phase; the statement is reset before returning either way. */
+#define NODE_SCAN_REMOTE_PAGE 20000
+static int g_node_scan_remote_page = NODE_SCAN_REMOTE_PAGE;
+
+void cbm_store_test_set_remote_scan_page(int rows) {
+    g_node_scan_remote_page = rows > 0 ? rows : NODE_SCAN_REMOTE_PAGE;
+}
+
+/* Refill rbuf with the next remote page. */
+static int node_scan_remote_fill(cbm_store_node_scan_t *scan) {
+    cbm_store_t *s = scan->store;
+    cbm_store_free_nodes(scan->rbuf, scan->rbuf_count); /* all handed out (zeroed) */
+    scan->rbuf = NULL;
+    scan->rbuf_count = 0;
+    scan->rbuf_next = 0;
+    cbm_node_t *rows = NULL;
+    int n = 0;
+    int rc = s->remote_ops->scan_nodes(s->remote_ctx, scan->project, scan->label, scan->keyed,
+                                       scan->after_file, scan->last_id, g_node_scan_remote_page,
+                                       &rows, &n);
+    if (rc != CBM_STORE_OK) {
+        return remote_status(s, rc);
+    }
+    if (n < g_node_scan_remote_page) {
+        scan->remote_done = true;
+    }
+    if (n > 0) {
+        scan->keyed = true;
+        scan->last_id = rows[n - SKIP_ONE].id;
+        if (!scan->label) {
+            const char *f = rows[n - SKIP_ONE].file_path;
+            char *dup = strdup(f ? f : "");
+            if (!dup) {
+                cbm_store_free_nodes(rows, n);
+                return CBM_STORE_ERR;
+            }
+            free(scan->after_file);
+            scan->after_file = dup;
+        }
+    }
+    scan->rbuf = rows;
+    scan->rbuf_count = n;
+    return CBM_STORE_OK;
+}
+
+static int node_scan_page_remote(cbm_store_node_scan_t *scan, cbm_node_t *out, int max,
+                                 int *got) {
+    *got = 0;
+    if (scan->rbuf_next >= scan->rbuf_count) {
+        if (scan->remote_done) {
+            scan->done = true;
+            return CBM_STORE_OK;
+        }
+        if (node_scan_remote_fill(scan) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+        if (scan->rbuf_count == 0) {
+            scan->done = true;
+            return CBM_STORE_OK;
+        }
+    }
+    int left = scan->rbuf_count - scan->rbuf_next;
+    int n = left < max ? left : max;
+    memcpy(out, scan->rbuf + scan->rbuf_next, (size_t)n * sizeof(cbm_node_t));
+    memset(scan->rbuf + scan->rbuf_next, 0, (size_t)n * sizeof(cbm_node_t));
+    scan->rbuf_next += n;
+    if (scan->rbuf_next >= scan->rbuf_count && scan->remote_done) {
+        scan->done = true;
+    }
+    *got = n;
+    return CBM_STORE_OK;
+}
+
 static int node_scan_page(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *got) {
+    if (scan->remote_paged) {
+        return node_scan_page_remote(scan, out, max, got);
+    }
     *got = 0;
     cbm_store_t *s = scan->store;
     node_scan_stmt_t which = scan->phase;
@@ -3745,6 +3955,8 @@ void cbm_store_node_scan_close(cbm_store_node_scan_t *scan) {
         sqlite3_finalize(scan->stmts[i]);
     }
     sqlite3_value_free(scan->last_file);
+    free(scan->after_file);
+    cbm_store_free_nodes(scan->rbuf, scan->rbuf_count); /* handed-out rows are zeroed */
     cbm_store_free_nodes(scan->eager, scan->eager_count); /* rows not handed out */
     cbm_free(CBM_MEM_CLASS_STORE, scan->project);
     cbm_free(CBM_MEM_CLASS_STORE, scan->label);
@@ -7628,8 +7840,28 @@ static void remote_search_result_free(cbm_search_result_t *r) {
     memset(r, 0, sizeof(*r));
 }
 
-static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params,
+/* ".*" and its anchored forms match every string: as a filter they only
+ * force the remote search to fetch every node and test each one locally. */
+static bool regex_matches_everything(const char *re) {
+    static const char *const all[] = {".*", "^.*", ".*$", "^.*$", "(.*)", "^(.*)$", NULL};
+    for (int i = 0; all[i]; i++) {
+        if (strcmp(re, all[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int store_remote_search(cbm_store_t *s, const cbm_search_params_t *params_in,
                                cbm_search_output_t *out) {
+    cbm_search_params_t params_eff = *params_in;
+    if (params_eff.name_pattern && regex_matches_everything(params_eff.name_pattern)) {
+        params_eff.name_pattern = NULL;
+    }
+    if (params_eff.qn_pattern && regex_matches_everything(params_eff.qn_pattern)) {
+        params_eff.qn_pattern = NULL;
+    }
+    const cbm_search_params_t *params = &params_eff;
     int limit = params->limit > 0 ? params->limit : CBM_DEFAULT_SEARCH_LIMIT;
     int offset = params->offset > 0 ? params->offset : 0;
     bool local_filter = params->name_pattern || params->qn_pattern || params->file_pattern;
