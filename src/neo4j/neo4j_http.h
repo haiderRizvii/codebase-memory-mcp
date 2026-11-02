@@ -45,4 +45,11 @@ int cbm_neo4j_http_post(cbm_neo4j_http_t *h, const char *path, const char *body,
 
 void cbm_neo4j_http_close(cbm_neo4j_http_t *h);
 
+/* Tests: decode a chunked body that arrives `step` bytes at a time, as the
+ * socket reader does. 0 with *out (malloc'd, decoded bytes first), *consumed
+ * (raw bytes used) and *buffered (raw bytes read so far; those after
+ * *consumed are the next response's), 1 when truncated, -1 when malformed. */
+int cbm_neo4j_test_dechunk(const char *raw, size_t raw_len, size_t step, char **out,
+                           size_t *out_len, size_t *consumed, size_t *buffered);
+
 #endif /* CBM_NEO4J_HTTP_H */

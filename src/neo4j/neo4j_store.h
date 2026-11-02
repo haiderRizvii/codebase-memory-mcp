@@ -31,8 +31,21 @@ cbm_neo4j_attach_t cbm_neo4j_store_attach(cbm_store_t *s, const char *db_path, c
 int cbm_neo4j_native_query(const char *db_path, const char *project, const char *query,
                            int max_rows, cbm_cypher_result_t *out);
 
+/* query_graph's engine dialect rewritten for Neo4j: every node pattern is
+ * scoped to the project's current graph ({db: $db, gen: $gen} added to its
+ * property map), so cbm_neo4j_native_query can run it. Returns a malloc'd
+ * query, or NULL (why says so) when the query cannot be scoped safely, e.g.
+ * it reads the engine-only virtual properties in_degree / out_degree. */
+char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz);
+
 /* Tests: the Cypher cbm_store_list_files asks Neo4j first (File nodes only),
  * so a test can check which index Neo4j plans it with. */
 const char *cbm_neo4j_test_list_file_nodes_cypher(void);
+
+/* Tests: run a raw one-statement Neo4j response body through the row
+ * conversion cbm_store_list_files (column 0 as strings) and native
+ * query_graph use, without a server. */
+int cbm_neo4j_test_column_strings(const char *body, char ***out, int *count);
+int cbm_neo4j_test_native_rows(const char *body, int max_rows, cbm_cypher_result_t *out);
 
 #endif /* CBM_NEO4J_STORE_H */

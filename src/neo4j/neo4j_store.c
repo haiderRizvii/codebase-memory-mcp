@@ -26,6 +26,30 @@
     v ".id, " v ".project, " v ".label, " v ".name, " v ".qualified_name, " v ".file_path, " v \
       ".start_line, " v ".end_line, " v ".properties_json"
 #define N4S_NODE_NCOLS 9
+/* The same columns under their own names, for a query that also returns
+ * edge columns over the same variables (a RETURN may not repeat a name). */
+#define N4S_FAR_COLS(v) \
+    v ".id AS f_id, " v ".project AS f_project, " v ".label AS f_label, " v \
+      ".name AS f_name, " v ".qualified_name AS f_qn, " v ".file_path AS f_file, " v \
+      ".start_line AS f_start, " v ".end_line AS f_end, " v ".properties_json AS f_props"
+
+/* Edges prefetched for a set of nodes in one round trip (one per direction).
+ * types == NULL holds every type; otherwise only the listed ones. */
+typedef struct {
+    bool valid;
+    char **types;
+    int type_count;
+    int64_t *ids; /* sorted, unique: the nodes whose edges are all here */
+    int id_count;
+    cbm_edge_t *edges; /* sorted by (key node, edge id); key = target if by_target */
+    int edge_count;
+} n4s_edge_cache_t;
+
+/* Nodes read alongside edges (the far end of each edge), sorted by id. */
+typedef struct {
+    cbm_node_t *nodes;
+    int count;
+} n4s_node_cache_t;
 
 typedef struct {
     cbm_neo4j_t *c;
@@ -33,6 +57,14 @@ typedef struct {
     int64_t gen;
     char err[CBM_NEO4J_ERR_MAX];
     uint64_t queries; /* round trips issued (per-request backend report) */
+    /* A graph walk asks for one node's edges, then each neighbour, one round
+     * trip each: hundreds of thousands of them on a busy node. Edge reads
+     * therefore also return the far-end nodes, and a caller about to expand
+     * many nodes prefetches all their edges at once (cbm_store_prefetch_edges).
+     * Both are read-through caches of the same immutable generation. */
+    n4s_edge_cache_t edge_cache[2]; /* [0] by source, [1] by target */
+    n4s_node_cache_t chunk_nodes[2]; /* far ends of the last prefetch, per direction */
+    n4s_node_cache_t last_nodes;    /* far ends of the last single-node edge read */
 } n4s_ctx_t;
 
 /* ── Query plumbing ─────────────────────────────────────────────── */
@@ -134,8 +166,9 @@ static int collect_nodes(n4s_ctx_t *x, n4s_q_t *q, cbm_node_t **out, int *count)
             cbm_neo4j_result_free(&r);
             return CBM_STORE_ERR;
         }
+        yyjson_arr_iter it = yyjson_arr_iter_with(data);
         for (size_t i = 0; i < n; i++) {
-            node_from_row(yyjson_arr_get(data, i), 0, &arr[i]);
+            node_from_row(yyjson_arr_iter_next(&it), 0, &arr[i]);
         }
         *out = arr;
         *count = (int)n;
@@ -146,9 +179,14 @@ static int collect_nodes(n4s_ctx_t *x, n4s_q_t *q, cbm_node_t **out, int *count)
 
 /* ── Ops ────────────────────────────────────────────────────────── */
 
+static void caches_free(n4s_ctx_t *x);
+static const cbm_node_t *node_cache_find(const n4s_node_cache_t *c, int64_t id);
+static int node_copy(const cbm_node_t *src, cbm_node_t *dst);
+
 static void op_close(void *ctx) {
     n4s_ctx_t *x = ctx;
     if (x) {
+        caches_free(x);
         cbm_neo4j_close(x->c);
         free(x);
     }
@@ -177,6 +215,16 @@ static int one_node(n4s_ctx_t *x, n4s_q_t *q, cbm_node_t *out) {
 
 static int op_find_node_by_id(void *ctx, int64_t id, cbm_node_t *out) {
     n4s_ctx_t *x = ctx;
+    const cbm_node_t *hit = node_cache_find(&x->chunk_nodes[0], id);
+    if (!hit) {
+        hit = node_cache_find(&x->chunk_nodes[1], id);
+    }
+    if (!hit) {
+        hit = node_cache_find(&x->last_nodes, id);
+    }
+    if (hit) {
+        return node_copy(hit, out);
+    }
     n4s_q_t q;
     if (q_begin(x, &q,
                 "MATCH (n:CbmNode {db: $db, gen: $gen, id: $id}) RETURN " N4S_NODE_COLS(
@@ -252,9 +300,260 @@ static int op_find_nodes(void *ctx, cbm_remote_node_query_t kind, const char *pr
     return collect_nodes(x, &q, out, count);
 }
 
-static int collect_edges(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count) {
+/* ── Read-through caches (see n4s_ctx_t) ───────────────────────── */
+
+static char *n4s_dup(const char *s) {
+    size_t n = strlen(s ? s : "");
+    char *d = malloc(n + 1);
+    if (d) {
+        memcpy(d, s ? s : "", n + 1);
+    }
+    return d;
+}
+
+static int node_copy(const cbm_node_t *src, cbm_node_t *dst) {
+    memset(dst, 0, sizeof(*dst));
+    dst->id = src->id;
+    dst->start_line = src->start_line;
+    dst->end_line = src->end_line;
+    dst->project = n4s_dup(src->project);
+    dst->label = n4s_dup(src->label);
+    dst->name = n4s_dup(src->name);
+    dst->qualified_name = n4s_dup(src->qualified_name);
+    dst->file_path = n4s_dup(src->file_path);
+    dst->properties_json = n4s_dup(src->properties_json ? src->properties_json : "{}");
+    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name || !dst->file_path ||
+        !dst->properties_json) {
+        node_free(dst);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static void edge_fields_free(cbm_edge_t *e) {
+    free((void *)e->project);
+    free((void *)e->type);
+    free((void *)e->properties_json);
+    memset(e, 0, sizeof(*e));
+}
+
+static int edge_copy(const cbm_edge_t *src, cbm_edge_t *dst) {
+    *dst = *src;
+    dst->project = n4s_dup(src->project);
+    dst->type = n4s_dup(src->type);
+    dst->properties_json = n4s_dup(src->properties_json ? src->properties_json : "{}");
+    if (!dst->project || !dst->type || !dst->properties_json) {
+        edge_fields_free(dst);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static void node_cache_free(n4s_node_cache_t *c) {
+    for (int i = 0; i < c->count; i++) {
+        node_free(&c->nodes[i]);
+    }
+    free(c->nodes);
+    c->nodes = NULL;
+    c->count = 0;
+}
+
+static int cmp_node_id(const void *a, const void *b) {
+    int64_t x = ((const cbm_node_t *)a)->id;
+    int64_t y = ((const cbm_node_t *)b)->id;
+    return (x > y) - (x < y);
+}
+
+/* Take ownership of nodes[0..n): sort by id and drop duplicates. */
+static void node_cache_set(n4s_node_cache_t *c, cbm_node_t *nodes, int n) {
+    node_cache_free(c);
+    if (n <= 0) {
+        free(nodes);
+        return;
+    }
+    qsort(nodes, (size_t)n, sizeof(cbm_node_t), cmp_node_id);
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        if (w > 0 && nodes[w - 1].id == nodes[i].id) {
+            node_free(&nodes[i]);
+            continue;
+        }
+        if (w != i) {
+            nodes[w] = nodes[i];
+        }
+        w++;
+    }
+    c->nodes = nodes;
+    c->count = w;
+}
+
+static const cbm_node_t *node_cache_find(const n4s_node_cache_t *c, int64_t id) {
+    int lo = 0;
+    int hi = c->count - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        int64_t v = c->nodes[mid].id;
+        if (v == id) {
+            return &c->nodes[mid];
+        }
+        if (v < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return NULL;
+}
+
+static void edge_cache_free(n4s_edge_cache_t *c) {
+    for (int i = 0; i < c->type_count; i++) {
+        free(c->types[i]);
+    }
+    free(c->types);
+    free(c->ids);
+    for (int i = 0; i < c->edge_count; i++) {
+        edge_fields_free(&c->edges[i]);
+    }
+    free(c->edges);
+    memset(c, 0, sizeof(*c));
+}
+
+static void caches_free(n4s_ctx_t *x) {
+    edge_cache_free(&x->edge_cache[0]);
+    edge_cache_free(&x->edge_cache[1]);
+    node_cache_free(&x->chunk_nodes[0]);
+    node_cache_free(&x->chunk_nodes[1]);
+    node_cache_free(&x->last_nodes);
+}
+
+static int cmp_i64_asc(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static int cmp_edge_by_source(const void *a, const void *b) {
+    const cbm_edge_t *x = a;
+    const cbm_edge_t *y = b;
+    if (x->source_id != y->source_id) {
+        return (x->source_id > y->source_id) - (x->source_id < y->source_id);
+    }
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+static int cmp_edge_by_target(const void *a, const void *b) {
+    const cbm_edge_t *x = a;
+    const cbm_edge_t *y = b;
+    if (x->target_id != y->target_id) {
+        return (x->target_id > y->target_id) - (x->target_id < y->target_id);
+    }
+    return (x->id > y->id) - (x->id < y->id);
+}
+
+static bool ids_contain(const int64_t *ids, int n, int64_t id) {
+    int lo = 0;
+    int hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (ids[mid] == id) {
+            return true;
+        }
+        if (ids[mid] < id) {
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    return false;
+}
+
+static bool cache_has_type(const n4s_edge_cache_t *c, const char *type) {
+    if (!c->types) {
+        return true; /* every type was fetched */
+    }
+    if (!type) {
+        return false; /* asked for all types, only some are here */
+    }
+    for (int i = 0; i < c->type_count; i++) {
+        if (strcmp(c->types[i], type) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A cached answer to find_edges(node_id, by_target, type), in r.id order.
+ * Returns CBM_STORE_NOT_FOUND when the cache cannot answer it. */
+static int edge_cache_lookup(n4s_ctx_t *x, int64_t node_id, bool by_target, const char *type,
+                             cbm_edge_t **out, int *count) {
+    const n4s_edge_cache_t *c = &x->edge_cache[by_target ? 1 : 0];
+    if (!c->valid || !cache_has_type(c, type) || !ids_contain(c->ids, c->id_count, node_id)) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    /* first edge whose key is node_id */
+    int lo = 0;
+    int hi = c->edge_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        int64_t key = by_target ? c->edges[mid].target_id : c->edges[mid].source_id;
+        if (key < node_id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    int n = 0;
+    for (int i = lo; i < c->edge_count; i++) {
+        int64_t key = by_target ? c->edges[i].target_id : c->edges[i].source_id;
+        if (key != node_id) {
+            break;
+        }
+        if (!type || strcmp(c->edges[i].type, type) == 0) {
+            n++;
+        }
+    }
     *out = NULL;
     *count = 0;
+    if (n == 0) {
+        return CBM_STORE_OK;
+    }
+    cbm_edge_t *arr = calloc((size_t)n, sizeof(cbm_edge_t));
+    if (!arr) {
+        return CBM_STORE_ERR;
+    }
+    int w = 0;
+    for (int i = lo; i < c->edge_count && w < n; i++) {
+        int64_t key = by_target ? c->edges[i].target_id : c->edges[i].source_id;
+        if (key != node_id) {
+            break;
+        }
+        if (type && strcmp(c->edges[i].type, type) != 0) {
+            continue;
+        }
+        if (edge_copy(&c->edges[i], &arr[w]) != CBM_STORE_OK) {
+            for (int k = 0; k < w; k++) {
+                edge_fields_free(&arr[k]);
+            }
+            free(arr);
+            return CBM_STORE_ERR;
+        }
+        w++;
+    }
+    *out = arr;
+    *count = w;
+    return CBM_STORE_OK;
+}
+
+/* Edge rows: r.id, project, source, target, type, properties_json, then (when
+ * far_ends) the N4S_NODE_COLS of the node at the other end of the edge. */
+static int collect_edges_ex(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count,
+                            cbm_node_t **far, int *far_count) {
+    *out = NULL;
+    *count = 0;
+    if (far) {
+        *far = NULL;
+        *far_count = 0;
+    }
     cbm_neo4j_result_t r;
     if (q_run(x, q, &r) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
@@ -263,24 +562,39 @@ static int collect_edges(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count)
     size_t n = yyjson_arr_size(data);
     if (n > 0) {
         cbm_edge_t *arr = calloc(n, sizeof(cbm_edge_t));
-        if (!arr) {
+        cbm_node_t *nodes = far ? calloc(n, sizeof(cbm_node_t)) : NULL;
+        if (!arr || (far && !nodes)) {
+            free(arr);
+            free(nodes);
             cbm_neo4j_result_free(&r);
             return CBM_STORE_ERR;
         }
+        yyjson_arr_iter it = yyjson_arr_iter_with(data);
         for (size_t i = 0; i < n; i++) {
-            yyjson_val *e = yyjson_arr_get(data, i);
+            yyjson_val *e = yyjson_arr_iter_next(&it);
             arr[i].id = cbm_neo4j_val_int(cbm_neo4j_row_col(e, 0), 0);
             arr[i].project = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 1), "");
             arr[i].source_id = cbm_neo4j_val_int(cbm_neo4j_row_col(e, 2), 0);
             arr[i].target_id = cbm_neo4j_val_int(cbm_neo4j_row_col(e, 3), 0);
             arr[i].type = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 4), "");
             arr[i].properties_json = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 5), "{}");
+            if (nodes) {
+                node_from_row(e, 6, &nodes[i]);
+            }
         }
         *out = arr;
         *count = (int)n;
+        if (far) {
+            *far = nodes;
+            *far_count = (int)n;
+        }
     }
     cbm_neo4j_result_free(&r);
     return CBM_STORE_OK;
+}
+
+static int collect_edges(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count) {
+    return collect_edges_ex(x, q, out, count, NULL, NULL);
 }
 
 #define N4S_EDGE_RET \
@@ -289,21 +603,286 @@ static int collect_edges(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count)
 static int op_find_edges(void *ctx, int64_t node_id, bool by_target, const char *type,
                          cbm_edge_t **out, int *count) {
     n4s_ctx_t *x = ctx;
+    int cached = edge_cache_lookup(x, node_id, by_target, type, out, count);
+    if (cached != CBM_STORE_NOT_FOUND) {
+        return cached;
+    }
+    /* The far ends come back too: a caller walking these edges looks every
+     * one of them up next (find_node_by_id answers from last_nodes). */
     const char *cypher =
         by_target
             ? "MATCH (a:CbmNode)-[r]->(b:CbmNode {db: $db, gen: $gen, id: $id}) "
               "WHERE a.db = $db AND a.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
-              " ORDER BY r.id"
+              ", " N4S_FAR_COLS("a") " ORDER BY r.id"
             : "MATCH (a:CbmNode {db: $db, gen: $gen, id: $id})-[r]->(b:CbmNode) "
               "WHERE b.db = $db AND b.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
-              " ORDER BY r.id";
+              ", " N4S_FAR_COLS("b") " ORDER BY r.id";
     n4s_q_t q;
     if (q_begin(x, &q, cypher) != 0) {
         return CBM_STORE_ERR;
     }
     q_int(&q, "id", node_id);
     q_str(&q, "type", type);
-    return collect_edges(x, &q, out, count);
+    cbm_node_t *far = NULL;
+    int far_count = 0;
+    int rc = collect_edges_ex(x, &q, out, count, &far, &far_count);
+    if (rc == CBM_STORE_OK) {
+        node_cache_set(&x->last_nodes, far, far_count);
+    }
+    return rc;
+}
+
+/* Edges one prefetch may pull. Past it the walk would download a large
+ * share of the graph over HTTP, one uninterruptible response: the caller is
+ * told (CBM_STORE_SCAN_LIMIT) so it can answer another way. */
+#define N4S_PREFETCH_EDGE_CAP 50000
+
+/* Fetch every edge of ids[0..n) in one direction (types NULL: all types)
+ * plus their far-end nodes, replacing that direction's edge cache and the
+ * chunk node cache. A failure leaves the caches empty: reads then go to
+ * Neo4j one by one, so prefetching can only make a walk faster. More than
+ * N4S_PREFETCH_EDGE_CAP edges: CBM_STORE_SCAN_LIMIT, caches empty. */
+static int op_prefetch_edges(void *ctx, const int64_t *ids, int n, bool by_target,
+                             const char *const *types, int type_count) {
+    n4s_ctx_t *x = ctx;
+    n4s_edge_cache_t *c = &x->edge_cache[by_target ? 1 : 0];
+    edge_cache_free(c);
+    node_cache_free(&x->chunk_nodes[by_target ? 1 : 0]);
+    if (n <= 0) {
+        return CBM_STORE_OK;
+    }
+    int64_t *sorted = malloc((size_t)n * sizeof(int64_t));
+    if (!sorted) {
+        return CBM_STORE_ERR;
+    }
+    memcpy(sorted, ids, (size_t)n * sizeof(int64_t));
+    qsort(sorted, (size_t)n, sizeof(int64_t), cmp_i64_asc);
+    int u = 0;
+    for (int i = 0; i < n; i++) {
+        if (u == 0 || sorted[u - 1] != sorted[i]) {
+            sorted[u++] = sorted[i];
+        }
+    }
+    const char *cypher =
+        by_target
+            ? "MATCH (b:CbmNode {db: $db, gen: $gen}) WHERE b.id IN $ids "
+              "MATCH (a:CbmNode)-[r]->(b) "
+              "WHERE a.db = $db AND a.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET
+              ", " N4S_FAR_COLS("a") " LIMIT $cap"
+            : "MATCH (a:CbmNode {db: $db, gen: $gen}) WHERE a.id IN $ids "
+              "MATCH (a)-[r]->(b:CbmNode) "
+              "WHERE b.db = $db AND b.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET
+              ", " N4S_FAR_COLS("b") " LIMIT $cap";
+    n4s_q_t q;
+    if (q_begin(x, &q, cypher) != 0) {
+        free(sorted);
+        return CBM_STORE_ERR;
+    }
+    q_ids(&q, "ids", sorted, u);
+    q_int(&q, "cap", N4S_PREFETCH_EDGE_CAP + 1);
+    if (types && type_count > 0) {
+        q_types(&q, "types", (const char **)types, type_count);
+    } else {
+        yyjson_mut_obj_add_null(q.b.doc, q.params, "types");
+    }
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_node_t *far = NULL;
+    int far_count = 0;
+    if (collect_edges_ex(x, &q, &edges, &edge_count, &far, &far_count) != CBM_STORE_OK) {
+        free(sorted);
+        return CBM_STORE_ERR;
+    }
+    if (edge_count > N4S_PREFETCH_EDGE_CAP) {
+        cbm_store_free_edges(edges, edge_count);
+        cbm_store_free_nodes(far, far_count);
+        free(sorted);
+        return CBM_STORE_SCAN_LIMIT;
+    }
+    if (edge_count > 1) {
+        qsort(edges, (size_t)edge_count, sizeof(cbm_edge_t),
+              by_target ? cmp_edge_by_target : cmp_edge_by_source);
+    }
+    if (types && type_count > 0) {
+        c->types = calloc((size_t)type_count, sizeof(char *));
+        if (!c->types) {
+            cbm_store_free_edges(edges, edge_count);
+            cbm_store_free_nodes(far, far_count);
+            free(sorted);
+            return CBM_STORE_ERR;
+        }
+        c->type_count = type_count;
+        for (int i = 0; i < type_count; i++) {
+            c->types[i] = n4s_dup(types[i]);
+            if (!c->types[i]) {
+                edge_cache_free(c);
+                cbm_store_free_edges(edges, edge_count);
+                cbm_store_free_nodes(far, far_count);
+                free(sorted);
+                return CBM_STORE_ERR;
+            }
+        }
+    }
+    c->ids = sorted;
+    c->id_count = u;
+    c->edges = edges;
+    c->edge_count = edge_count;
+    c->valid = true;
+    node_cache_set(&x->chunk_nodes[by_target ? 1 : 0], far, far_count);
+    return CBM_STORE_OK;
+}
+
+static void op_cache_clear(void *ctx) {
+    caches_free((n4s_ctx_t *)ctx);
+}
+
+/* Append the node rows of r (columns from off) to *arr. */
+static int append_node_rows(cbm_neo4j_result_t *r, size_t off, cbm_node_t **arr, int *n,
+                            int *cap) {
+    yyjson_val *data = cbm_neo4j_result_data(r, 0);
+    size_t rows = yyjson_arr_size(data);
+    if (rows == 0) {
+        return CBM_STORE_OK;
+    }
+    if ((size_t)*n + rows > (size_t)*cap) {
+        size_t next = (size_t)*n + rows;
+        if (next < (size_t)*cap * 2) {
+            next = (size_t)*cap * 2;
+        }
+        if (next > INT_MAX) {
+            return CBM_STORE_ERR;
+        }
+        cbm_node_t *grown = realloc(*arr, next * sizeof(cbm_node_t));
+        if (!grown) {
+            return CBM_STORE_ERR;
+        }
+        *arr = grown;
+        *cap = (int)next;
+    }
+    size_t idx;
+    size_t max;
+    yyjson_val *e;
+    yyjson_arr_foreach(data, idx, max, e) {
+        node_from_row(e, off, &(*arr)[(*n)++]);
+    }
+    return CBM_STORE_OK;
+}
+
+/* Nodes for ids[0..n), sorted by id; ids with no node are skipped. */
+static int op_find_nodes_by_ids(void *ctx, const int64_t *ids, int n, cbm_node_t **out,
+                                int *count) {
+    n4s_ctx_t *x = ctx;
+    *out = NULL;
+    *count = 0;
+    cbm_node_t *arr = NULL;
+    int got = 0;
+    int cap = 0;
+    for (int base = 0; base < n; base += N4S_ID_CHUNK) {
+        int m = n - base < N4S_ID_CHUNK ? n - base : N4S_ID_CHUNK;
+        n4s_q_t q;
+        if (q_begin(x, &q,
+                    "MATCH (n:CbmNode {db: $db, gen: $gen}) WHERE n.id IN $ids "
+                    "RETURN " N4S_NODE_COLS("n")) != 0) {
+            cbm_store_free_nodes(arr, got);
+            return CBM_STORE_ERR;
+        }
+        q_ids(&q, "ids", ids + base, m);
+        cbm_neo4j_result_t r;
+        if (q_run(x, &q, &r) != CBM_STORE_OK) {
+            cbm_store_free_nodes(arr, got);
+            return CBM_STORE_ERR;
+        }
+        int rc = append_node_rows(&r, 0, &arr, &got, &cap);
+        cbm_neo4j_result_free(&r);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_nodes(arr, got);
+            return CBM_STORE_ERR;
+        }
+    }
+    if (got > 1) {
+        qsort(arr, (size_t)got, sizeof(cbm_node_t), cmp_node_id);
+    }
+    *out = arr;
+    *count = got;
+    return CBM_STORE_OK;
+}
+
+#define N4S_FILE_CHUNK 2000
+
+/* Nodes of files[0..n) (project-filtered like find_nodes BY_FILE), grouped by
+ * file in input order and by id within a file. */
+static int op_find_nodes_by_files(void *ctx, const char *project, const char *const *files, int n,
+                                  cbm_node_t **out, int *count) {
+    n4s_ctx_t *x = ctx;
+    *out = NULL;
+    *count = 0;
+    cbm_node_t *arr = NULL;
+    int got = 0;
+    int cap = 0;
+    for (int base = 0; base < n; base += N4S_FILE_CHUNK) {
+        int m = n - base < N4S_FILE_CHUNK ? n - base : N4S_FILE_CHUNK;
+        n4s_q_t q;
+        if (q_begin(x, &q,
+                    "UNWIND range(0, size($files) - 1) AS i "
+                    "MATCH (n:CbmNode {db: $db, gen: $gen, file_path: $files[i]}) "
+                    "WHERE $project IS NULL OR n.project = $project "
+                    "RETURN i, " N4S_NODE_COLS("n") " ORDER BY i, n.id") != 0) {
+            cbm_store_free_nodes(arr, got);
+            return CBM_STORE_ERR;
+        }
+        yyjson_mut_val *list = yyjson_mut_arr(q.b.doc);
+        for (int i = 0; i < m; i++) {
+            yyjson_mut_arr_add_strcpy(q.b.doc, list, files[base + i] ? files[base + i] : "");
+        }
+        yyjson_mut_obj_add_val(q.b.doc, q.params, "files", list);
+        q_str(&q, "project", project);
+        cbm_neo4j_result_t r;
+        if (q_run(x, &q, &r) != CBM_STORE_OK) {
+            cbm_store_free_nodes(arr, got);
+            return CBM_STORE_ERR;
+        }
+        int rc = append_node_rows(&r, 1, &arr, &got, &cap);
+        cbm_neo4j_result_free(&r);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_nodes(arr, got);
+            return CBM_STORE_ERR;
+        }
+    }
+    *out = arr;
+    *count = got;
+    return CBM_STORE_OK;
+}
+
+/* One page of a node scan in the order of find_nodes ALL (file_path, id) or
+ * BY_LABEL (id), continuing after (after_file, after_id) when keyed. */
+static int op_scan_nodes(void *ctx, const char *project, const char *label, bool keyed,
+                         const char *after_file, int64_t after_id, int max, cbm_node_t **out,
+                         int *count) {
+    n4s_ctx_t *x = ctx;
+    /* Each page seeks the index whose order it returns ((db, gen, id) or
+     * (db, gen, file_path)), so a page costs its own rows, not a re-sort of
+     * the whole label or graph. */
+    const char *cypher =
+        label ? "MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, id) "
+                "WHERE n.db = $db AND n.gen = $gen AND n.id > $after_id AND n.label = $label "
+                "AND ($project IS NULL OR n.project = $project) "
+                "RETURN " N4S_NODE_COLS("n") " ORDER BY n.id LIMIT $max"
+              : "MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, file_path) "
+                "WHERE n.db = $db AND n.gen = $gen AND n.file_path >= $after_file "
+                "AND ($keyed = false OR n.file_path > $after_file OR n.id > $after_id) "
+                "AND ($project IS NULL OR n.project = $project) "
+                "RETURN " N4S_NODE_COLS("n") " ORDER BY n.file_path, n.id LIMIT $max";
+    n4s_q_t q;
+    if (q_begin(x, &q, cypher) != 0) {
+        return CBM_STORE_ERR;
+    }
+    q_str(&q, "project", project);
+    q_str(&q, "label", label);
+    yyjson_mut_obj_add_bool(q.b.doc, q.params, "keyed", keyed);
+    q_str(&q, "after_file", after_file ? after_file : "");
+    q_int(&q, "after_id", keyed ? after_id : INT64_MIN);
+    q_int(&q, "max", max);
+    return collect_nodes(x, &q, out, count);
 }
 
 static int op_find_edges_by_type(void *ctx, const char *project, const char *type, cbm_edge_t **out,
@@ -626,8 +1205,9 @@ static int collect_bfs_edges(n4s_ctx_t *x, int64_t root_id, const cbm_node_hop_t
             cbm_neo4j_result_free(&r);
             return CBM_STORE_ERR;
         }
+        yyjson_arr_iter it = yyjson_arr_iter_with(data);
         for (int i = 0; i < en; i++) {
-            yyjson_val *e = yyjson_arr_get(data, (size_t)i);
+            yyjson_val *e = yyjson_arr_iter_next(&it);
             cbm_edge_info_t *ei = &out->edges[i];
             ei->from_name = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 0), "");
             ei->to_name = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 1), "");
@@ -906,8 +1486,9 @@ static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_
         cbm_neo4j_result_free(&r);
         return CBM_STORE_ERR;
     }
+    yyjson_arr_iter it = yyjson_arr_iter_with(data);
     for (size_t i = 0; i < n; i++) {
-        yyjson_val *e = yyjson_arr_get(data, i);
+        yyjson_val *e = yyjson_arr_iter_next(&it);
         node_from_row(e, 0, &rows[i].node);
         rows[i].in_degree = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, N4S_NODE_NCOLS), 0);
         rows[i].out_degree = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, N4S_NODE_NCOLS + 1), 0);
@@ -922,7 +1503,13 @@ static int op_search(void *ctx, const cbm_remote_search_t *s, cbm_search_result_
     return CBM_STORE_OK;
 }
 
-/* Column 0 of statement `stmt`, as a malloc'd string array. */
+/* Column 0 of statement `stmt`, as a malloc'd string array.
+ *
+ * Every loop over result rows walks them with an iterator: rows are objects,
+ * and yyjson_arr_get(data, i) on an array of objects steps through all i
+ * earlier rows, so an indexed loop is quadratic: reading 272,571 rows (the
+ * File list of a 4.5M-node graph) took 156 s in a benchmark, 3 ms with the
+ * iterator, and search_code's scope step took 86 s on that graph. */
 static int collect_strings(cbm_neo4j_result_t *r, size_t stmt, char ***out, int *count) {
     yyjson_val *data = cbm_neo4j_result_data(r, stmt);
     size_t n = yyjson_arr_size(data);
@@ -935,8 +1522,9 @@ static int collect_strings(cbm_neo4j_result_t *r, size_t stmt, char ***out, int 
     if (!arr) {
         return CBM_STORE_ERR;
     }
+    yyjson_arr_iter it = yyjson_arr_iter_with(data);
     for (size_t i = 0; i < n; i++) {
-        arr[i] = cbm_neo4j_val_strdup(cbm_neo4j_row_col(yyjson_arr_get(data, i), 0), "");
+        arr[i] = cbm_neo4j_val_strdup(cbm_neo4j_row_col(yyjson_arr_iter_next(&it), 0), "");
     }
     *out = arr;
     *count = (int)n;
@@ -1127,14 +1715,16 @@ static int op_schema(void *ctx, const char *project, bool with_props, cbm_schema
         cbm_neo4j_result_free(&r);
         return CBM_STORE_ERR;
     }
+    yyjson_arr_iter lit = yyjson_arr_iter_with(labels);
     for (size_t i = 0; i < nl; i++) {
-        yyjson_val *e = yyjson_arr_get(labels, i);
+        yyjson_val *e = yyjson_arr_iter_next(&lit);
         out->node_labels[i].label = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 0), "");
         out->node_labels[i].count = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, 1), 0);
     }
     out->node_label_count = (int)nl;
+    yyjson_arr_iter tit = yyjson_arr_iter_with(types);
     for (size_t i = 0; i < nt; i++) {
-        yyjson_val *e = yyjson_arr_get(types, i);
+        yyjson_val *e = yyjson_arr_iter_next(&tit);
         out->edge_types[i].type = cbm_neo4j_val_strdup(cbm_neo4j_row_col(e, 0), "");
         out->edge_types[i].count = (int)cbm_neo4j_val_int(cbm_neo4j_row_col(e, 1), 0);
     }
@@ -1197,6 +1787,11 @@ static const cbm_store_remote_ops_t k_neo4j_ops = {
     .list_files = op_list_files,
     .schema = op_schema,
     .queries = op_queries,
+    .prefetch_edges = op_prefetch_edges,
+    .cache_clear = op_cache_clear,
+    .find_nodes_by_ids = op_find_nodes_by_ids,
+    .find_nodes_by_files = op_find_nodes_by_files,
+    .scan_nodes = op_scan_nodes,
 };
 
 /* ── Attach ─────────────────────────────────────────────────────── */
@@ -1371,6 +1966,282 @@ static const char *native_write_keyword(const char *q) {
     return NULL;
 }
 
+/* Statement 0 of r as a query_graph result, at most max_rows rows (0: the
+ * legacy 100000). Returns 0, or -1 with out->error set. */
+static int native_rows(cbm_neo4j_result_t *r, int max_rows, cbm_cypher_result_t *out) {
+    yyjson_val *res0 = yyjson_arr_get_first(r->results);
+    yyjson_val *cols = yyjson_obj_get(res0, "columns");
+    yyjson_val *data = yyjson_obj_get(res0, "data");
+    int ncols = (int)yyjson_arr_size(cols);
+    int nrows = (int)yyjson_arr_size(data);
+    int cap = max_rows > 0 ? max_rows : 100000;
+    if (nrows > cap) {
+        nrows = cap;
+        out->truncated = true;
+    }
+    out->columns = calloc(ncols > 0 ? (size_t)ncols : 1, sizeof(char *));
+    out->rows = calloc(nrows > 0 ? (size_t)nrows : 1, sizeof(char **));
+    if (!out->columns || !out->rows) {
+        native_fail(out, "out of memory");
+        return -1;
+    }
+    out->col_count = ncols; /* only now may cbm_cypher_result_free walk columns */
+    for (int j = 0; j < ncols; j++) {
+        out->columns[j] = cbm_neo4j_val_strdup(yyjson_arr_get(cols, (size_t)j), "");
+    }
+    yyjson_arr_iter it = yyjson_arr_iter_with(data);
+    for (int i = 0; i < nrows; i++) {
+        yyjson_val *e = yyjson_arr_iter_next(&it);
+        const char **row = calloc(ncols > 0 ? (size_t)ncols : 1, sizeof(char *));
+        if (!row) {
+            /* A partial result must not read as complete. */
+            native_fail(out, "out of memory");
+            return -1;
+        }
+        for (int j = 0; j < ncols; j++) {
+            yyjson_val *v = cbm_neo4j_row_col(e, (size_t)j);
+            row[j] = cbm_neo4j_val_strdup(v, yyjson_is_null(v) ? "null" : "");
+        }
+        out->rows[i] = row;
+        out->row_count = i + 1;
+    }
+    return 0;
+}
+
+/* ── Engine dialect → scoped Neo4j Cypher ──────────────────────── */
+
+/* Does tokens[i] ('(') open a node pattern `( [var] (:L(|L)*)* [{...}] )`?
+ * On success *brace is the '{' index (-1 if none) and *close the ')'. */
+static bool node_pattern_shape(const cbm_token_t *t, int count, int i, int *brace, int *close) {
+    int j = i + 1;
+    if (j < count && t[j].type == TOK_IDENT) {
+        j++;
+    }
+    while (j < count && t[j].type == TOK_COLON) {
+        j++;
+        if (j >= count || t[j].type != TOK_IDENT) {
+            return false;
+        }
+        j++;
+        while (j + 1 < count && t[j].type == TOK_PIPE && t[j + 1].type == TOK_IDENT) {
+            j += 2;
+        }
+    }
+    *brace = -1;
+    if (j < count && t[j].type == TOK_LBRACE) {
+        *brace = j;
+        int depth = 0;
+        for (; j < count; j++) {
+            if (t[j].type == TOK_LBRACE) {
+                depth++;
+            } else if (t[j].type == TOK_RBRACE && --depth == 0) {
+                break;
+            }
+        }
+        if (j >= count) {
+            return false;
+        }
+        j++;
+    }
+    if (j >= count || t[j].type != TOK_RPAREN) {
+        return false;
+    }
+    *close = j;
+    return true;
+}
+
+static bool tok_is_word(const cbm_token_t *t, const char *word) {
+    if (t->type != TOK_IDENT || !t->text) {
+        return false;
+    }
+    size_t n = strlen(word);
+    if (strlen(t->text) != n) {
+        return false;
+    }
+    for (size_t k = 0; k < n; k++) {
+        if (tolower((unsigned char)t->text[k]) != word[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+typedef struct {
+    int pos;          /* byte offset in the original query */
+    int seq;          /* order among insertions at the same offset */
+    const char *text; /* inserted there */
+} n4s_insert_t;
+
+static int cmp_insert(const void *a, const void *b) {
+    const n4s_insert_t *x = a;
+    const n4s_insert_t *y = b;
+    if (x->pos != y->pos) {
+        return x->pos < y->pos ? -1 : 1;
+    }
+    return x->seq < y->seq ? -1 : (x->seq > y->seq);
+}
+
+char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
+    if (why && why_sz) {
+        why[0] = '\0';
+    }
+    if (!query) {
+        return NULL;
+    }
+    cbm_lex_result_t lx = {0};
+    if (cbm_lex(query, &lx) < 0 || lx.error) {
+        if (why) {
+            (void)snprintf(why, why_sz, "query does not tokenize");
+        }
+        cbm_lex_free(&lx);
+        return NULL;
+    }
+    const cbm_token_t *t = lx.tokens;
+    int count = lx.count;
+    /* up to three insertions per node pattern: label, its closing ')', scope */
+    n4s_insert_t *ins = calloc((size_t)count * 3 + 1, sizeof(n4s_insert_t));
+    if (!ins) {
+        cbm_lex_free(&lx);
+        return NULL;
+    }
+    int nins = 0;
+    bool in_match = false; /* inside a MATCH clause's pattern list */
+    bool ok = true;
+    for (int i = 0; i < count && ok; i++) {
+        cbm_token_type_t ty = t[i].type;
+        if (ty == TOK_MATCH) {
+            in_match = true;
+        } else if (ty == TOK_WHERE || ty == TOK_RETURN || ty == TOK_WITH || ty == TOK_UNWIND ||
+                   ty == TOK_ORDER || ty == TOK_UNION) {
+            in_match = false;
+        }
+        /* n.in_degree / n.out_degree are computed by the engine, not stored. */
+        if (ty == TOK_DOT && i + 1 < count &&
+            (tok_is_word(&t[i + 1], "in_degree") || tok_is_word(&t[i + 1], "out_degree"))) {
+            if (why) {
+                (void)snprintf(why, why_sz, "it reads the engine-only property %s",
+                               t[i + 1].text);
+            }
+            ok = false;
+            break;
+        }
+        if (ty != TOK_LPAREN) {
+            continue;
+        }
+        int brace = -1;
+        int close = -1;
+        if (!node_pattern_shape(t, count, i, &brace, &close)) {
+            continue;
+        }
+        cbm_token_type_t prev = i > 0 ? t[i - 1].type : TOK_EOF;
+        cbm_token_type_t next = close + 1 < count ? t[close + 1].type : TOK_EOF;
+        bool pattern_context = prev == TOK_MATCH || prev == TOK_DASH || prev == TOK_GT ||
+                               prev == TOK_LT || (prev == TOK_COMMA && in_match) ||
+                               (prev == TOK_EQ && in_match) || next == TOK_DASH || next == TOK_LT;
+        if (!pattern_context) {
+            continue;
+        }
+        /* Every graph node carries the CbmNode label, and Neo4j's indexes
+         * are per label: without it each pattern scans every node of every
+         * project in the database. */
+        int j = i + 1;
+        if (t[j].type == TOK_IDENT) {
+            j++;
+        }
+        int first_colon = t[j].type == TOK_COLON ? j : -1;
+        int colons = 0;
+        bool alternation = false;
+        while (j < close && t[j].type == TOK_COLON) {
+            colons++;
+            j += 2; /* ':' Label */
+            while (j + 1 < close && t[j].type == TOK_PIPE) {
+                alternation = true;
+                j += 2;
+            }
+        }
+        int label_end = j; /* the '{' or ')' after the labels */
+        if (first_colon < 0) {
+            ins[nins].pos = t[label_end].pos;
+            ins[nins].seq = nins;
+            ins[nins].text = brace >= 0 ? ":CbmNode " : ":CbmNode";
+            nins++;
+        } else if (!alternation) {
+            ins[nins].pos = t[first_colon].pos; /* (n:CbmNode:Function) */
+            ins[nins].seq = nins;
+            ins[nins].text = ":CbmNode";
+            nins++;
+        } else if (colons == 1) {
+            ins[nins].pos = t[first_colon].pos + 1; /* (n:CbmNode&(File|Folder)) */
+            ins[nins].seq = nins;
+            ins[nins].text = "CbmNode&(";
+            nins++;
+            ins[nins].pos = t[label_end].pos;
+            ins[nins].seq = nins;
+            ins[nins].text = ")";
+            nins++;
+        } else {
+            if (why) {
+                (void)snprintf(why, why_sz, "it mixes label alternation with several labels");
+            }
+            ok = false;
+            break;
+        }
+        if (brace >= 0) {
+            bool empty = t[brace + 1].type == TOK_RBRACE;
+            ins[nins].pos = t[brace].pos + 1;
+            ins[nins].text = empty ? "db: $db, gen: $gen" : "db: $db, gen: $gen, ";
+        } else {
+            ins[nins].pos = t[close].pos;
+            ins[nins].text = " {db: $db, gen: $gen}";
+        }
+        ins[nins].seq = nins;
+        nins++;
+    }
+    cbm_lex_free(&lx);
+    if (!ok || nins == 0) {
+        if (ok && why) {
+            (void)snprintf(why, why_sz, "no node pattern to scope");
+        }
+        free(ins);
+        return NULL;
+    }
+    qsort(ins, (size_t)nins, sizeof(n4s_insert_t), cmp_insert);
+    size_t qlen = strlen(query);
+    size_t extra = 0;
+    for (int k = 0; k < nins; k++) {
+        extra += strlen(ins[k].text);
+    }
+    char *outq = malloc(qlen + extra + 1);
+    if (!outq) {
+        free(ins);
+        return NULL;
+    }
+    size_t w = 0;
+    size_t from = 0;
+    for (int k = 0; k < nins; k++) {
+        size_t at = (size_t)ins[k].pos;
+        if (at > qlen || at < from) {
+            free(ins);
+            free(outq);
+            if (why) {
+                (void)snprintf(why, why_sz, "token positions are inconsistent");
+            }
+            return NULL;
+        }
+        memcpy(outq + w, query + from, at - from);
+        w += at - from;
+        size_t tl = strlen(ins[k].text);
+        memcpy(outq + w, ins[k].text, tl);
+        w += tl;
+        from = at;
+    }
+    memcpy(outq + w, query + from, qlen - from);
+    w += qlen - from;
+    outq[w] = '\0';
+    free(ins);
+    return outq;
+}
+
 int cbm_neo4j_native_query(const char *db_path, const char *project, const char *query,
                            int max_rows, cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
@@ -1404,42 +2275,42 @@ int cbm_neo4j_native_query(const char *db_path, const char *project, const char 
         op_close(x);
         return -1;
     }
-    yyjson_val *res0 = yyjson_arr_get_first(r.results);
-    yyjson_val *cols = yyjson_obj_get(res0, "columns");
-    yyjson_val *data = yyjson_obj_get(res0, "data");
-    int ncols = (int)yyjson_arr_size(cols);
-    int nrows = (int)yyjson_arr_size(data);
-    int cap = max_rows > 0 ? max_rows : 100000;
-    if (nrows > cap) {
-        nrows = cap;
-        out->truncated = true;
-    }
-    out->col_count = ncols;
-    out->columns = calloc(ncols > 0 ? (size_t)ncols : 1, sizeof(char *));
-    out->rows = calloc(nrows > 0 ? (size_t)nrows : 1, sizeof(char **));
-    if (!out->columns || !out->rows) {
-        cbm_neo4j_result_free(&r);
-        op_close(x);
-        native_fail(out, "out of memory");
-        return -1;
-    }
-    for (int j = 0; j < ncols; j++) {
-        out->columns[j] = cbm_neo4j_val_strdup(yyjson_arr_get(cols, (size_t)j), "");
-    }
-    for (int i = 0; i < nrows; i++) {
-        yyjson_val *e = yyjson_arr_get(data, (size_t)i);
-        const char **row = calloc(ncols > 0 ? (size_t)ncols : 1, sizeof(char *));
-        if (!row) {
-            break;
-        }
-        for (int j = 0; j < ncols; j++) {
-            yyjson_val *v = cbm_neo4j_row_col(e, (size_t)j);
-            row[j] = cbm_neo4j_val_strdup(v, yyjson_is_null(v) ? "null" : "");
-        }
-        out->rows[i] = row;
-        out->row_count = i + 1;
-    }
+    int rc = native_rows(&r, max_rows, out);
     cbm_neo4j_result_free(&r);
     op_close(x);
+    return rc;
+}
+
+/* Tests: a raw Neo4j response body, checked like cbm_neo4j_batch_run checks
+ * one, read through the same row conversion the store uses. */
+static int test_result_from_body(const char *body, cbm_neo4j_result_t *r) {
+    r->doc = yyjson_read(body, strlen(body), 0);
+    r->results = yyjson_obj_get(yyjson_doc_get_root(r->doc), "results");
+    if (!r->doc || cbm_neo4j_result_shape_error(r->results, 1) != NULL) {
+        cbm_neo4j_result_free(r);
+        return -1;
+    }
     return 0;
+}
+
+int cbm_neo4j_test_native_rows(const char *body, int max_rows, cbm_cypher_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    cbm_neo4j_result_t r;
+    if (test_result_from_body(body, &r) != 0) {
+        native_fail(out, "unparseable test body");
+        return -1;
+    }
+    int rc = native_rows(&r, max_rows, out);
+    cbm_neo4j_result_free(&r);
+    return rc;
+}
+
+int cbm_neo4j_test_column_strings(const char *body, char ***out, int *count) {
+    cbm_neo4j_result_t r;
+    if (test_result_from_body(body, &r) != 0) {
+        return CBM_STORE_ERR;
+    }
+    int rc = collect_strings(&r, 0, out, count);
+    cbm_neo4j_result_free(&r);
+    return rc;
 }

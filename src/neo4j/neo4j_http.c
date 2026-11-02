@@ -4,6 +4,7 @@
 #include "neo4j/neo4j_http.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -346,11 +347,18 @@ static bool n4_header(const char *hdrs, const char *end, const char *name, char 
     return false;
 }
 
-/* Decode a chunked body in place. Returns decoded length, or -1 when the
- * buffer does not yet hold the complete body (*need_more set) or is malformed. */
-static long long n4_dechunk(char *body, size_t len, size_t *consumed, bool *need_more) {
-    size_t r = 0;
-    size_t w = 0;
+/* Decode a chunked body in place, resuming where the previous call stopped:
+ * body[0, *r) is already decoded into body[0, *w) (w <= r). Each complete
+ * chunk after *r is moved down to *w once, and bytes at or after the final *r
+ * are never touched, so a body that arrives over many reads is copied once in
+ * all -- copying and re-decoding it from the start after every read of at
+ * most 16 KB was quadratic in its size. Returns the decoded length once the
+ * last chunk and trailers are in (*consumed: raw bytes used), or -1 with
+ * *need_more set when the buffer ends mid-chunk, or -1 alone when malformed. */
+static long long n4_dechunk(char *body, size_t len, size_t *r_io, size_t *w_io, size_t *consumed,
+                            bool *need_more) {
+    size_t r = *r_io;
+    size_t w = *w_io;
     *need_more = false;
     for (;;) {
         const char *crlf = NULL;
@@ -392,14 +400,95 @@ static long long n4_dechunk(char *body, size_t len, size_t *consumed, bool *need
                 t += 2;
             }
         }
-        if (data_start + sz + 2 > len) {
+        if (sz > len || data_start + sz + 2 > len) {
             *need_more = true;
             return -1;
         }
         memmove(body + w, body + data_start, (size_t)sz);
         w += (size_t)sz;
         r = data_start + (size_t)sz + 2;
+        *r_io = r;
+        *w_io = w;
     }
+}
+
+/* Appends more response bytes to b: count read, 0 at end of input, -1 on error. */
+typedef int (*n4_more_fn)(void *src, n4_buf_t *b);
+
+/* Read a chunked body that starts at b->data + body_off, pulling more bytes
+ * with `more` until it is complete. 0: the *out_len decoded bytes sit at
+ * body_off and *consumed counts the bytes of b->data used (anything after is
+ * the next response's); 1: the input ended first; -1: malformed. */
+static int n4_read_chunked(n4_buf_t *b, size_t body_off, n4_more_fn more, void *src,
+                           size_t *out_len, size_t *consumed) {
+    size_t r = 0;
+    size_t w = 0;
+    for (;;) {
+        bool need_more = false;
+        long long dl =
+            n4_dechunk(b->data + body_off, b->len - body_off, &r, &w, consumed, &need_more);
+        if (dl >= 0) {
+            *out_len = (size_t)dl;
+            *consumed += body_off;
+            return 0;
+        }
+        if (!need_more) {
+            return -1;
+        }
+        if (more(src, b) <= 0) {
+            return 1;
+        }
+    }
+}
+
+static int n4_sock_more(void *src, n4_buf_t *b) {
+    return n4_recv_more(src, b);
+}
+
+typedef struct {
+    const char *raw;
+    size_t len;
+    size_t pos;
+    size_t step;
+} n4_test_src_t;
+
+/* Tests: hand over the next `step` raw bytes through the same buffer growth
+ * n4_recv_more uses. */
+static int n4_test_more(void *src, n4_buf_t *b) {
+    n4_test_src_t *t = src;
+    size_t n = t->len - t->pos < t->step ? t->len - t->pos : t->step;
+    if (n == 0) {
+        return 0;
+    }
+    if (n4_buf_reserve(b, n) != 0) {
+        return -1;
+    }
+    memcpy(b->data + b->len, t->raw + t->pos, n);
+    t->pos += n;
+    b->len += n;
+    b->data[b->len] = '\0';
+    return (int)n;
+}
+
+int cbm_neo4j_test_dechunk(const char *raw, size_t raw_len, size_t step, char **out,
+                           size_t *out_len, size_t *consumed, size_t *buffered) {
+    if (step == 0 || step > INT_MAX) {
+        return -1;
+    }
+    n4_test_src_t src = {raw, raw_len, 0, step};
+    n4_buf_t b = {0};
+    if (n4_test_more(&src, &b) < 0 || n4_buf_reserve(&b, 0) != 0) {
+        free(b.data);
+        return -1;
+    }
+    int rc = n4_read_chunked(&b, 0, n4_test_more, &src, out_len, consumed);
+    if (rc != 0) {
+        free(b.data);
+        return rc;
+    }
+    *out = b.data;
+    *buffered = b.len;
+    return 0;
 }
 
 /* One request/response exchange over the plain socket. Returns 0 on success,
@@ -473,40 +562,17 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
     size_t out_len = 0;
     size_t consumed = 0;
     if (chunked) {
-        for (;;) {
-            /* Work on a scratch copy so a partial decode never corrupts b. */
-            size_t avail = b.len - body_off;
-            char *tmp = malloc(avail + 1);
-            if (!tmp) {
-                free(b.data);
-                n4_disconnect(h);
-                return -1;
-            }
-            memcpy(tmp, b.data + body_off, avail);
-            bool need_more = false;
-            long long dl = n4_dechunk(tmp, avail, &consumed, &need_more);
-            if (dl >= 0) {
-                memcpy(b.data + body_off, tmp, (size_t)dl);
-                free(tmp);
-                out_len = (size_t)dl;
-                /* Decoded bytes sit before `consumed`, so any surplus after it
-                 * is still intact for the carry below. */
-                consumed += body_off;
-                break;
-            }
-            free(tmp);
-            if (!need_more) {
-                free(b.data);
-                n4_disconnect(h);
-                n4_err(err, err_sz, "malformed chunked response from Neo4j%s", NULL);
-                return -1;
-            }
-            if (n4_recv_more(h, &b) <= 0) {
-                free(b.data);
-                n4_disconnect(h);
-                n4_err(err, err_sz, "truncated response from Neo4j%s", NULL);
-                return -1;
-            }
+        /* Decoded bytes sit before `consumed`, so any surplus after it is
+         * still intact for the carry below. */
+        int rc = n4_read_chunked(&b, body_off, n4_sock_more, h, &out_len, &consumed);
+        if (rc != 0) {
+            free(b.data);
+            n4_disconnect(h);
+            n4_err(err, err_sz,
+                   rc > 0 ? "truncated response from Neo4j%s"
+                          : "malformed chunked response from Neo4j%s",
+                   NULL);
+            return -1;
         }
     } else if (content_len >= 0) {
         if ((size_t)content_len > N4_RESP_MAX) {
