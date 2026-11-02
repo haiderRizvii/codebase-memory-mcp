@@ -41,6 +41,9 @@ enum {
     MCP_COMPARE_MAX_SCAN_LIMIT = 10000000,
     MCP_COMPARE_SET_BYTE_BUDGET = 512 * 1024,
     MCP_QUERY_MAX_VISIBLE_ROWS = 99998,
+    /* query_graph on a Neo4j-backed project: engine budget before the query
+     * is answered natively in Neo4j instead (query_graph_native_fallback). */
+    MCP_QUERY_ENGINE_REMOTE_BUDGET_MS = 10000,
     /* search_code `context`: lines of surrounding source per hit, the same
      * ceiling as `source_max_lines`. Clamped at the handler and again where
      * the window is computed, so the arithmetic never overflows. */
@@ -6124,6 +6127,54 @@ static char *query_graph_budget_floor_text(const cbm_cypher_result_t *result, in
     return cbm_sb_finish(&sb);
 }
 
+/* The engine ran out of its budget on a Neo4j-backed project: run the same
+ * query in Neo4j, every node pattern scoped to this project's graph. On
+ * success *result is replaced and carries a warning naming the switch; on
+ * failure *result keeps a time-limit error that says why Neo4j could not
+ * answer either. */
+static int query_graph_native_fallback(const char *project, const char *query,
+                                       cbm_cypher_result_t *result) {
+    char why[CBM_SZ_256] = "";
+    char *scoped = cbm_neo4j_scope_query(query, why, sizeof(why));
+    cbm_cypher_result_t nres = {0};
+    int rc = -1;
+    if (scoped) {
+        char db_path[CBM_SZ_1K];
+        project_db_path(project, db_path, sizeof(db_path));
+        rc = cbm_neo4j_native_query(db_path, project, scoped, 0, &nres);
+        free(scoped);
+        if (rc < 0) {
+            (void)snprintf(why, sizeof(why), "Neo4j rejected it: %.200s",
+                           nres.error ? nres.error : "query failed");
+        }
+    }
+    if (rc < 0) {
+        cbm_cypher_result_free(&nres);
+        char msg[CBM_SZ_1K];
+        (void)snprintf(msg, sizeof(msg),
+                       "query exceeded the execution time limit (%d s in the in-process engine) "
+                       "and could not be answered natively in Neo4j (%s) — narrow the pattern "
+                       "with a WHERE filter or LIMIT, or pass native:true with Neo4j Cypher "
+                       "($db/$gen scope this project's graph)",
+                       MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000, why[0] ? why : "unsupported");
+        free(result->error);
+        result->error = heap_strdup(msg);
+        return -1;
+    }
+    cbm_cypher_result_free(result);
+    *result = nres;
+    char note[CBM_SZ_1K];
+    (void)snprintf(note, sizeof(note),
+                   "answered natively by Neo4j: in the in-process engine this query would "
+                   "read too much of the Neo4j-backed graph over HTTP (budget %d s). Values are "
+                   "Neo4j-typed (numbers compare as numbers, a missing property is null)%s%s",
+                   MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000, result->warning ? "; " : "",
+                   result->warning ? result->warning : "");
+    free(result->warning);
+    result->warning = heap_strdup(note);
+    return 0;
+}
+
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
     char *project = get_project_arg(args);
@@ -6239,6 +6290,17 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         char native_db_path[CBM_SZ_1K];
         project_db_path(effective_project, native_db_path, sizeof(native_db_path));
         rc = cbm_neo4j_native_query(native_db_path, effective_project, query, 0, &result);
+    } else if (cbm_store_is_remote(store) && !missed_graph && effective_project) {
+        /* Neo4j-backed: the engine reads the graph over HTTP, so a query that
+         * touches much of it (a full count, an aggregation, a hub's callers)
+         * can take minutes. Give it a short budget; if it runs out, answer
+         * the same query inside Neo4j, scoped to this project's graph. */
+        cbm_cypher_set_budget_ms(MCP_QUERY_ENGINE_REMOTE_BUDGET_MS);
+        rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
+        cbm_cypher_set_budget_ms(0);
+        if (rc < 0 && result.timed_out) {
+            rc = query_graph_native_fallback(effective_project, query, &result);
+        }
     } else {
         rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
     }
@@ -15832,6 +15894,138 @@ static bool search_hit_file_within_root(root_containment_t *containment, const c
  * hit. Graph results retain one identity per distinct node plus at most 500
  * line numbers each; raw matches retain only the caller's requested page.
  * Exact totals are counted while the stream is consumed to EOF. */
+/* Distinct matched files whose graph nodes are read in one batch: a match
+ * stream over hundreds of thousands of files otherwise costs one graph read
+ * per file — one HTTP round trip each on a Neo4j-backed project. */
+#define SEARCH_NODE_WINDOW 2000
+
+/* Split one scan record "<file><sep><line><sep><text>" in place. Returns the
+ * root-relative file, or NULL for a malformed or path-filtered record. */
+static const char *search_record_split(char *line, ssize_t line_length, const char *root_path,
+                                       size_t root_len, bool has_path_filter,
+                                       cbm_regex_t *path_regex, char **sep1_out, char **sep2_out) {
+    size_t len = (size_t)line_length;
+    while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+        line[--len] = '\0';
+    }
+    if (len == 0) {
+        return NULL;
+    }
+#ifdef _WIN32
+    char sep = '\t';
+#else
+    char sep = ':';
+#endif
+    char *sep1 = strchr(line, (unsigned char)sep);
+    if (!sep1) {
+        return NULL;
+    }
+    char *sep2 = strchr(sep1 + SKIP_ONE, (unsigned char)sep);
+    if (!sep2) {
+        return NULL;
+    }
+    *sep1 = '\0';
+    *sep2 = '\0';
+#ifdef _WIN32
+    cbm_normalize_path_sep(line);
+#endif
+    const char *file = strip_root_prefix(line, root_path, root_len);
+    if (has_path_filter && cbm_regexec(path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
+        return NULL;
+    }
+    *sep1_out = sep1;
+    *sep2_out = sep2;
+    return file;
+}
+
+/* One window of the stream: its distinct files in stream order (a file that
+ * recurs after another one gets a second entry), each with its containment
+ * verdict and its nodes nodes[first..first+count). */
+typedef struct {
+    char **files;
+    bool *inside;
+    int *first;
+    int *count;
+    int n;
+    cbm_node_t *nodes;
+    int node_count;
+} search_window_t;
+
+static void search_window_reset(search_window_t *w) {
+    for (int i = 0; i < w->n; i++) {
+        free(w->files[i]);
+    }
+    w->n = 0;
+    free_file_nodes(w->nodes, w->node_count);
+    w->nodes = NULL;
+    w->node_count = 0;
+}
+
+static void search_window_free(search_window_t *w) {
+    search_window_reset(w);
+    free(w->files);
+    free(w->inside);
+    free(w->first);
+    free(w->count);
+    memset(w, 0, sizeof(*w));
+}
+
+static bool search_window_alloc(search_window_t *w) {
+    w->files = calloc(SEARCH_NODE_WINDOW, sizeof(char *));
+    w->inside = calloc(SEARCH_NODE_WINDOW, sizeof(bool));
+    w->first = calloc(SEARCH_NODE_WINDOW, sizeof(int));
+    w->count = calloc(SEARCH_NODE_WINDOW, sizeof(int));
+    return w->files && w->inside && w->first && w->count;
+}
+
+/* Read every window file's nodes in one batched store call and slice them
+ * per file. A failed read leaves the files without nodes, exactly as the
+ * per-file read ignored its failures. */
+static bool search_window_load_nodes(search_window_t *w, cbm_store_t *store, const char *project) {
+    if (!store || w->n == 0) {
+        return true;
+    }
+    const char **want = malloc((size_t)w->n * sizeof(char *));
+    int *want_entry = malloc((size_t)w->n * sizeof(int));
+    if (!want || !want_entry) {
+        free(want);
+        free(want_entry);
+        return false;
+    }
+    int nw = 0;
+    for (int i = 0; i < w->n; i++) {
+        w->first[i] = 0;
+        w->count[i] = 0;
+        if (w->inside[i]) {
+            want[nw] = w->files[i];
+            want_entry[nw] = i;
+            nw++;
+        }
+    }
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    if (nw > 0 &&
+        cbm_store_find_nodes_by_files(store, project, want, nw, &nodes, &node_count) ==
+            CBM_STORE_OK) {
+        /* grouped by file in request order, so one forward walk slices them */
+        int at = 0;
+        for (int k = 0; k < nw; k++) {
+            int e = want_entry[k];
+            w->first[e] = at;
+            while (at < node_count && nodes[at].file_path &&
+                   strcmp(nodes[at].file_path, w->files[e]) == 0) {
+                at++;
+            }
+            w->count[e] = at - w->first[e];
+        }
+        w->nodes = nodes;
+        w->node_count = node_count;
+    }
+    free(want);
+    free(want_entry);
+    return true;
+}
+
 static bool scan_and_classify_grep_matches(
     FILE *fp, const char *root_path, size_t root_len, bool has_path_filter, cbm_regex_t *path_regex,
     const char *pattern, bool use_regex, bool raw_content_offset_set, size_t raw_content_offset,
@@ -15840,16 +16034,19 @@ static bool scan_and_classify_grep_matches(
     int *raw_cap, int *raw_content_truncated, int *grep_count) {
     char *line = NULL;
     size_t line_capacity = 0;
-    char *current_file = NULL;
-    bool current_file_inside = false;
-    cbm_node_t *file_nodes = NULL;
-    int file_node_count = 0;
     root_containment_t containment;
     root_containment_init(&containment, root_path);
     search_result_index_t sr_index = {0};
+    search_window_t win = {0};
+    if (!search_window_alloc(&win)) {
+        search_window_free(&win);
+        root_containment_free(&containment);
+        return false;
+    }
     for (int i = 0; i < *sr_count; i++) {
         if (!search_result_index_reserve(&sr_index)) {
             search_result_index_free(&sr_index);
+            search_window_free(&win);
             root_containment_free(&containment);
             return false;
         }
@@ -15859,104 +16056,139 @@ static bool scan_and_classify_grep_matches(
     bool content_regex_ready = use_regex && pattern &&
                                cbm_regcomp(&content_regex, pattern, CBM_REG_EXTENDED) == CBM_REG_OK;
     bool ok = true;
+    bool at_eof = false;
 
-    for (;;) {
-        ssize_t line_length = cbm_getline(&line, &line_capacity, fp);
-        if (line_length < 0) {
-            if (!feof(fp)) {
-                ok = false;
-            }
+    while (ok && !at_eof) {
+        /* Pass A: the next window's distinct files and how many records it
+         * spans; the record that would open file SEARCH_NODE_WINDOW+1 starts
+         * the next window. */
+        fpos_t window_start;
+        if (fgetpos(fp, &window_start) != 0) {
+            ok = false;
             break;
         }
-        size_t len = (size_t)line_length;
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len == 0) {
-            continue;
-        }
-
-#ifdef _WIN32
-        char sep = '\t';
-#else
-        char sep = ':';
-#endif
-        char *sep1 = strchr(line, (unsigned char)sep);
-        if (!sep1) {
-            continue;
-        }
-        char *sep2 = strchr(sep1 + SKIP_ONE, (unsigned char)sep);
-        if (!sep2) {
-            continue;
-        }
-        *sep1 = '\0';
-        *sep2 = '\0';
-#ifdef _WIN32
-        cbm_normalize_path_sep(line);
-#endif
-        const char *file = strip_root_prefix(line, root_path, root_len);
-        if (has_path_filter && cbm_regexec(path_regex, file, 0, NULL, 0) != CBM_REG_OK) {
-            continue;
-        }
-        if (!current_file || strcmp(current_file, file) != 0) {
-            free_file_nodes(file_nodes, file_node_count);
-            file_nodes = NULL;
-            file_node_count = 0;
-            free(current_file);
-            current_file = heap_strdup(file);
-            if (!current_file) {
+        search_window_reset(&win);
+        long long records = 0;
+        for (;;) {
+            fpos_t record_start;
+            if (fgetpos(fp, &record_start) != 0) {
                 ok = false;
                 break;
             }
-            current_file_inside = search_hit_file_within_root(&containment, root_path, file);
-            if (store && current_file_inside) {
-                (void)cbm_store_find_nodes_by_file(store, project, file, &file_nodes,
-                                                   &file_node_count);
+            ssize_t line_length = cbm_getline(&line, &line_capacity, fp);
+            if (line_length < 0) {
+                if (!feof(fp)) {
+                    ok = false;
+                }
+                at_eof = true;
+                break;
             }
+            char *sep1 = NULL;
+            char *sep2 = NULL;
+            const char *file = search_record_split(line, line_length, root_path, root_len,
+                                                   has_path_filter, path_regex, &sep1, &sep2);
+            if (file && (win.n == 0 || strcmp(win.files[win.n - SKIP_ONE], file) != 0)) {
+                if (win.n == SEARCH_NODE_WINDOW) {
+                    if (fsetpos(fp, &record_start) != 0) {
+                        ok = false;
+                    }
+                    break; /* this record opens the next window */
+                }
+                win.files[win.n] = heap_strdup(file);
+                if (!win.files[win.n]) {
+                    ok = false;
+                    break;
+                }
+                win.inside[win.n] = search_hit_file_within_root(&containment, root_path, file);
+                win.n++;
+            }
+            records++;
         }
-        if (!current_file_inside) {
-            /* Every hit of a file that resolves outside the root is dropped
-             * and, like a path_filter miss, not counted. */
+        if (!ok) {
+            break;
+        }
+        if (records == 0) {
+            break;
+        }
+        if (!search_window_load_nodes(&win, store, project)) {
+            ok = false;
+            break;
+        }
+
+        /* Pass B: the same records again, classified with the window's nodes. */
+        if (fsetpos(fp, &window_start) != 0) {
+            ok = false;
+            break;
+        }
+        int entry = -1;
+        for (long long r = 0; r < records; r++) {
+            ssize_t line_length = cbm_getline(&line, &line_capacity, fp);
+            if (line_length < 0) {
+                ok = false; /* the file shrank under us */
+                break;
+            }
+            char *sep1 = NULL;
+            char *sep2 = NULL;
+            const char *file = search_record_split(line, line_length, root_path, root_len,
+                                                   has_path_filter, path_regex, &sep1, &sep2);
+            if (!file) {
+                continue;
+            }
+            if (entry < 0 || strcmp(win.files[entry], file) != 0) {
+                entry++;
+                if (entry >= win.n || strcmp(win.files[entry], file) != 0) {
+                    ok = false; /* pass A and pass B disagree: never classify blind */
+                    break;
+                }
+            }
+            if (!win.inside[entry]) {
+                /* Every hit of a file that resolves outside the root is dropped
+                 * and, like a path_filter miss, not counted. */
+                continue;
+            }
+            if (*grep_count == INT_MAX) {
+                ok = false;
+                break;
+            }
+            (*grep_count)++;
+
+            grep_match_t hit = {0};
+            hit.file = heap_strdup(file);
+            if (!hit.file) {
+                ok = false;
+                break;
+            }
+            hit.line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
+            const char *content = sep2 + SKIP_ONE;
+            size_t match_start = 0;
+            size_t match_end = 0;
+            bool match_known = search_match_bounds(content, pattern, use_regex,
+                                                   content_regex_ready ? &content_regex : NULL,
+                                                   &match_start, &match_end);
+            search_raw_preview(&hit, content, raw_content_offset_set, raw_content_offset,
+                               match_known, match_start, match_end);
+            cbm_node_t *file_nodes = win.count[entry] > 0 ? win.nodes + win.first[entry] : NULL;
+            if (!classify_grep_hit(&hit, file_nodes, win.count[entry], sr, sr_count, sr_cap,
+                                   &sr_index, raw, raw_offset, raw_limit, raw_count,
+                                   raw_stored_count, raw_cap, raw_content_truncated)) {
+                free(hit.file);
+                ok = false;
+                break;
+            }
+            free(hit.file);
+        }
+        if (ok && !at_eof) {
+            /* resume where pass A stopped: the next window's first record */
             continue;
         }
-        if (*grep_count == INT_MAX) {
-            ok = false;
-            break;
-        }
-        (*grep_count)++;
-
-        grep_match_t hit = {0};
-        hit.file = heap_strdup(file);
-        if (!hit.file) {
-            ok = false;
-            break;
-        }
-        hit.line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
-        const char *content = sep2 + SKIP_ONE;
-        size_t match_start = 0;
-        size_t match_end = 0;
-        bool match_known = search_match_bounds(content, pattern, use_regex,
-                                               content_regex_ready ? &content_regex : NULL,
-                                               &match_start, &match_end);
-        search_raw_preview(&hit, content, raw_content_offset_set, raw_content_offset, match_known,
-                           match_start, match_end);
-        if (!classify_grep_hit(&hit, file_nodes, file_node_count, sr, sr_count, sr_cap, &sr_index,
-                               raw, raw_offset, raw_limit, raw_count, raw_stored_count, raw_cap,
-                               raw_content_truncated)) {
-            free(hit.file);
-            ok = false;
-            break;
-        }
-        free(hit.file);
     }
 
     search_result_index_free(&sr_index);
+    search_window_free(&win);
     root_containment_free(&containment);
     if (content_regex_ready) {
         cbm_regfree(&content_regex);
     }
-    free_file_nodes(file_nodes, file_node_count);
-    free(current_file);
     free(line);
     return ok;
 }
@@ -18387,16 +18619,55 @@ static bool detect_walk_run(cbm_store_t *store, const char *project,
     if (rows) {
         memset(rows, 0, (size_t)total * sizeof(*rows));
     }
+    /* Read every row's node in one batched store call (one round trip per
+     * few thousand rows on a Neo4j-backed project, not one per row), then
+     * lay them out in the walk's (hop, qualified name) order. */
     int n = 0;
+    int64_t *ids = NULL;
+    int id_count = 0;
+    cbm_node_t *found = NULL;
+    int found_count = 0;
+    if (ok && total > 0) {
+        ids = safe_realloc(NULL, (size_t)total * sizeof(*ids));
+        ok = ids != NULL;
+        for (int i = 0; ok && i < total; i++) {
+            if (hits[i].hop != 0) {
+                ids[id_count++] = hits[i].id;
+            }
+        }
+        ok = ok && cbm_store_find_nodes_by_ids(store, ids, id_count, &found, &found_count) ==
+                       CBM_STORE_OK;
+    }
     for (int i = 0; ok && i < total; i++) {
         if (hits[i].hop == 0) {
             continue;
         }
-        ok = cbm_store_find_node_by_id(store, hits[i].id, &rows[n].node) == CBM_STORE_OK;
+        int lo = 0;
+        int hi = found_count - SKIP_ONE;
+        int at = -1;
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (found[mid].id == hits[i].id) {
+                at = mid;
+                break;
+            }
+            if (found[mid].id < hits[i].id) {
+                lo = mid + SKIP_ONE;
+            } else {
+                hi = mid - SKIP_ONE;
+            }
+        }
+        ok = at >= 0; /* a reached node the store cannot read fails the walk, as before */
         if (ok) {
+            /* walk hits are distinct ids, so each found row moves out once */
+            rows[n].node = found[at];
+            memset(&found[at], 0, sizeof(found[at]));
+            found[at].id = hits[i].id; /* keep the array sorted for later searches */
             rows[n++].hop = hits[i].hop;
         }
     }
+    free(ids);
+    cbm_store_free_nodes(found, found_count);
     impact->visited = rows;
     impact->visited_count = n;
     if (!ok) {

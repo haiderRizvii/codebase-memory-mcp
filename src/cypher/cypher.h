@@ -336,6 +336,9 @@ typedef struct {
      * length hop range was clamped to the engine ceiling (#797) — without
      * this, a clamped expansion is indistinguishable from "no such path". */
     char *warning;
+    /* True when the query failed because it ran past its wall-clock budget
+     * (error is then the "execution time limit" message). */
+    bool timed_out;
 } cbm_cypher_result_t;
 
 /* Execute a Cypher query against a store.
@@ -345,6 +348,13 @@ typedef struct {
  * Returns -1 on error (check out->error for message). */
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out);
+
+/* Wall-clock budget in milliseconds for queries executed on the calling
+ * thread from now on; <= 0 restores the default (30 s). A caller with a
+ * faster way to answer a heavy query (query_graph on a Neo4j-backed project
+ * runs it natively) gives the engine a shorter budget and falls back when
+ * result.timed_out. */
+void cbm_cypher_set_budget_ms(int64_t budget_ms);
 
 /* Free a query result. */
 void cbm_cypher_result_free(cbm_cypher_result_t *r);

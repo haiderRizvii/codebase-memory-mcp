@@ -3267,6 +3267,7 @@ static _Thread_local bool g_cypher_truncated = false;
  * fails with this store error rather than answer from the rows read so far. */
 static _Thread_local char g_cypher_scan_error[CBM_SZ_512];
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
+static _Thread_local int64_t g_cypher_budget_ms = 0;               /* caller budget; 0 = default */
 
 #ifdef CBM_ENABLE_TEST_SEAMS
 static _Thread_local cbm_cypher_test_clock_fn g_cypher_deadline_clock = NULL;
@@ -3288,7 +3289,8 @@ static uint64_t cypher_deadline_now(void) {
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
     int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
-                                                        : CYPHER_DEADLINE_BUDGET_MS;
+                     : g_cypher_budget_ms > 0             ? g_cypher_budget_ms
+                                                          : CYPHER_DEADLINE_BUDGET_MS;
     g_cypher_deadline_ms = cypher_deadline_now() + (uint64_t)budget;
 }
 
@@ -3312,6 +3314,10 @@ static bool cypher_deadline_exceeded(void) {
  * thread. 0 = trip on the first hot-loop check; <0 restores the default. */
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms) {
     g_cypher_deadline_override_ms = budget_ms;
+}
+
+void cbm_cypher_set_budget_ms(int64_t budget_ms) {
+    g_cypher_budget_ms = budget_ms > 0 ? budget_ms : 0;
 }
 
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
@@ -3593,6 +3599,11 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
      * points here", i.e. it reported live code as dead. Losing rows is
      * recoverable; asserting a match does not exist when it does is not. */
     for (int ei = 0; ei < edge_count; ei++) {
+        /* One busy node can have hundreds of thousands of edges: the
+         * per-binding check in expand_pattern_rels never sees them. */
+        if ((ei & CYPHER_DEADLINE_CHECK_MASK) == 0 && ei > 0 && cypher_deadline_exceeded()) {
+            return;
+        }
         int64_t tid = inbound ? edges[ei].source_id : edges[ei].target_id;
         if (bound_to && tid != bound_to_id) {
             continue; /* edge does not reach the already-bound terminal node */
@@ -3667,6 +3678,9 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
      * detection, so a saturated source cannot report match_count == 0 and get a
      * fabricated OPTIONAL "no match" row. */
     for (int v = 0; v < tr.visited_count; v++) {
+        if ((v & CYPHER_DEADLINE_CHECK_MASK) == 0 && v > 0 && cypher_deadline_exceeded()) {
+            break;
+        }
         cbm_node_hop_t *hop = &tr.visited[v];
         if (hop->hop > max_depth) {
             g_cypher_truncated = true; /* the probe hop found a candidate past the cap */
@@ -3750,6 +3764,51 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     }
 }
 
+/* Bindings whose edges are fetched together: on a remote store each chunk
+ * is one round trip for all their edges and far-end nodes, instead of one per
+ * binding plus one per neighbour. */
+#define CYPHER_PREFETCH_CHUNK 512
+
+/* Prefetch the edges `rel` will read for bindings[from..to) (their `var`
+ * node), in the direction(s) the expansion reads them. A hint only: results
+ * never depend on it. When the remote store reports more edges than it
+ * prefetches at once, walking them here would download a large share of the
+ * graph: the query's budget is spent now, so the caller can answer it
+ * another way (query_graph runs it natively in Neo4j). */
+static void prefetch_rel_edges(cbm_store_t *store, const cbm_rel_pattern_t *rel,
+                               binding_t *bindings, int from, int to, const char *var,
+                               bool by_target, bool also_other_direction) {
+    if (!cbm_store_is_remote(store) || to <= from) {
+        return;
+    }
+    int64_t *ids = malloc((size_t)(to - from) * sizeof(int64_t));
+    if (!ids) {
+        return;
+    }
+    int n = 0;
+    for (int bi = from; bi < to; bi++) {
+        cbm_node_t *node = binding_get(&bindings[bi], var);
+        if (node) {
+            ids[n++] = node->id;
+        }
+    }
+    bool too_large = false;
+    if (n > 0) {
+        too_large = cbm_store_prefetch_edges(store, ids, n, by_target,
+                                             (const char *const *)rel->types,
+                                             rel->type_count) == CBM_STORE_SCAN_LIMIT;
+        if (!too_large && also_other_direction) {
+            too_large = cbm_store_prefetch_edges(store, ids, n, !by_target,
+                                                 (const char *const *)rel->types,
+                                                 rel->type_count) == CBM_STORE_SCAN_LIMIT;
+        }
+    }
+    free(ids);
+    if (too_large) {
+        g_cypher_timed_out = true; /* sticky: every loop now stops */
+    }
+}
+
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
                                 int *bind_count, int *bind_cap, const char **var_name,
                                 bool is_optional) {
@@ -3778,9 +3837,19 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         }
         int new_count = 0;
 
+        bool rel_inbound = rel->direction && strcmp(rel->direction, "inbound") == 0;
+        bool rel_any = rel->direction && strcmp(rel->direction, "any") == 0;
         for (int bi = 0; bi < *bind_count; bi++) {
             if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
                 break;
+            }
+            if (!is_variable_length && bi % CYPHER_PREFETCH_CHUNK == 0) {
+                int to = bi + CYPHER_PREFETCH_CHUNK < *bind_count ? bi + CYPHER_PREFETCH_CHUNK
+                                                                   : *bind_count;
+                prefetch_rel_edges(store, rel, *bindings, bi, to, *var_name, rel_inbound, rel_any);
+                if (cypher_deadline_exceeded()) {
+                    break;
+                }
             }
             binding_t *b = &(*bindings)[bi];
             cbm_node_t *src = binding_get(b, *var_name);
@@ -5850,9 +5919,21 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
     }
     int new_count = 0;
 
+    const char *term_var = patn->nodes[1].variable ? patn->nodes[1].variable : "";
     for (int bi = 0; bi < *bind_count; bi++) {
+        if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+            break;
+        }
+        if (bi % CYPHER_PREFETCH_CHUNK == 0) {
+            int to = bi + CYPHER_PREFETCH_CHUNK < *bind_count ? bi + CYPHER_PREFETCH_CHUNK
+                                                               : *bind_count;
+            prefetch_rel_edges(store, rel, *bindings, bi, to, term_var, scan_targets, false);
+            if (cypher_deadline_exceeded()) {
+                break;
+            }
+        }
         binding_t *b = &(*bindings)[bi];
-        cbm_node_t *term = binding_get(b, patn->nodes[1].variable ? patn->nodes[1].variable : "");
+        cbm_node_t *term = binding_get(b, term_var);
         int match_count = 0;
         if (term) {
             /* Detection is decoupled from the write budget: scan every edge and
@@ -5879,6 +5960,10 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                     cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
                 }
                 for (int ei = 0; ei < edge_count; ei++) {
+                    if ((ei & CYPHER_DEADLINE_CHECK_MASK) == 0 && ei > 0 &&
+                        cypher_deadline_exceeded()) {
+                        break;
+                    }
                     int64_t sid = scan_targets ? edges[ei].source_id : edges[ei].target_id;
                     cbm_node_t found = {0};
                     if (cbm_store_find_node_by_id(store, sid, &found) != CBM_STORE_OK) {
@@ -6206,6 +6291,12 @@ static int start_source_next(start_source_t *src, cbm_node_t *out, int max) {
     const cbm_node_pattern_t *node = src->node;
     int got = 0;
     while (got < max && !src->done) {
+        /* A selective inline filter ({qualified_name: ...}) can reject page
+         * after page of a large graph before one start node is kept: the
+         * budget must hold inside this loop, not only between chunks. */
+        if (cypher_deadline_exceeded()) {
+            break;
+        }
         if (!src->scan) {
             if (!src->labels || !start_source_next_label(src)) {
                 src->done = true;
@@ -6640,8 +6731,19 @@ static char *cypher_abort_error(void) {
     return heap_strdup("query aborted: out of memory or an allocation limit was reached");
 }
 
+static int cypher_execute_impl(cbm_store_t *store, const char *query, const char *project,
+                               int max_rows, cbm_cypher_result_t *out);
+
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
+    int rc = cypher_execute_impl(store, query, project, max_rows, out);
+    out->timed_out = rc < 0 && g_cypher_timed_out;
+    cbm_store_prefetch_clear(store); /* release this query's prefetched edges */
+    return rc;
+}
+
+static int cypher_execute_impl(cbm_store_t *store, const char *query, const char *project,
+                               int max_rows, cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
     g_cypher_depth_clamped = 0;
     g_cypher_trail_truncated = 0;
