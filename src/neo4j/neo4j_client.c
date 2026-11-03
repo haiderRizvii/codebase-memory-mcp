@@ -327,6 +327,29 @@ cbm_neo4j_t *cbm_neo4j_connect(const cbm_neo4j_config_t *cfg, char *err, size_t 
     return c;
 }
 
+/* Client wait beyond the server-side time limit: the server's own
+ * "terminated" reply needs to arrive. */
+#define CBM_NEO4J_WAIT_MARGIN_MS 10000
+
+int cbm_neo4j_set_read_only(cbm_neo4j_t *c, int max_execution_ms) {
+    if (!c) {
+        return -1;
+    }
+    char hdrs[96];
+    if (max_execution_ms > 0) {
+        (void)snprintf(hdrs, sizeof(hdrs), "access-mode: READ\r\nmax-execution-time: %d\r\n",
+                       max_execution_ms);
+    } else {
+        (void)snprintf(hdrs, sizeof(hdrs), "access-mode: READ\r\n");
+    }
+    /* The server stops the query at max_execution_ms and says so: waiting
+     * much longer than that only delays the error of a hung request. */
+    cbm_neo4j_http_set_max_wait(c->http, max_execution_ms > 0
+                                             ? max_execution_ms + CBM_NEO4J_WAIT_MARGIN_MS
+                                             : 0);
+    return cbm_neo4j_http_set_extra_headers(c->http, hdrs);
+}
+
 void cbm_neo4j_close(cbm_neo4j_t *c) {
     if (!c) {
         return;

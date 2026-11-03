@@ -6455,8 +6455,49 @@ TEST(cypher_stream_default_chunk_boundary) {
 
 /* ══════════════════════════════════════════════════════════════════ */
 
+/* What the engine scans first: the label of the start pattern after its
+ * selective-end planning, or "" for every node. query_graph uses it to send a
+ * query Neo4j-side at once when that scan alone exceeds the engine budget. */
+TEST(cypher_start_scan_reports_the_first_scan) {
+    char label[64];
+    bool expands = true;
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (n) RETURN count(n)", label, sizeof(label), &expands),
+              1);
+    ASSERT_STR_EQ(label, "");
+    ASSERT_FALSE(expands);
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (c:Class) WHERE c.name STARTS WITH 'D' RETURN c.name",
+                                    label, sizeof(label), &expands),
+              1);
+    ASSERT_STR_EQ(label, "Class");
+    ASSERT_FALSE(expands);
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (a:Method)-[:CALLS]->(b:Method) RETURN a.name", label,
+                                    sizeof(label), &expands),
+              1);
+    ASSERT_STR_EQ(label, "Method");
+    ASSERT_TRUE(expands);
+    /* the selective end ({qualified_name}) becomes the start: it has no label */
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (a:Method)-[:CALLS]->(b {qualified_name: 'x'}) "
+                                    "RETURN count(a)",
+                                    label, sizeof(label), &expands),
+              1);
+    ASSERT_STR_EQ(label, "");
+    ASSERT_TRUE(expands);
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (n:Function|Method) RETURN n.name", label,
+                                    sizeof(label), &expands),
+              1);
+    ASSERT_STR_EQ(label, "Function|Method");
+    /* no single start scan, or no query at all: unknown */
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (a:A) RETURN a.name UNION MATCH (b:B) RETURN b.name",
+                                    label, sizeof(label), &expands),
+              0);
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (n RETURN", label, sizeof(label), &expands), 0);
+    ASSERT_EQ(cbm_cypher_start_scan("MATCH (n:Function) RETURN n", label, 4, &expands), 0);
+    PASS();
+}
+
 SUITE(cypher) {
     /* Lexer */
+    RUN_TEST(cypher_start_scan_reports_the_first_scan);
     RUN_TEST(cypher_lex_simple_match);
     RUN_TEST(cypher_lex_relationship);
     RUN_TEST(cypher_lex_string_literal);

@@ -42,7 +42,8 @@ enum {
     MCP_COMPARE_SET_BYTE_BUDGET = 512 * 1024,
     MCP_QUERY_MAX_VISIBLE_ROWS = 99998,
     /* query_graph on a Neo4j-backed project: engine budget before the query
-     * is answered natively in Neo4j instead (query_graph_native_fallback). */
+     * is answered natively in Neo4j instead (query_graph_native_run); a
+     * query predicted to need longer goes to Neo4j at once (qg_predict_native). */
     MCP_QUERY_ENGINE_REMOTE_BUDGET_MS = 10000,
     /* search_code `context`: lines of surrounding source per hit, the same
      * ceiling as `source_max_lines`. Clamped at the handler and again where
@@ -1871,6 +1872,23 @@ static char *mcp_result_from_json(const char *args_json, const char *json) {
  *  MCP SERVER
  * ══════════════════════════════════════════════════════════════════ */
 
+/* query_graph on Neo4j-backed projects: node counts per (project,
+ * generation, label) that predict the engine's start scan, and queries that
+ * needed Neo4j's native answer, so they skip the engine next time. Keyed by
+ * generation: a reindex starts from a clean slate. */
+#define QG_PLAN_COUNT_SLOTS 64
+#define QG_PLAN_NATIVE_SLOTS 256
+typedef struct {
+    char key[CBM_SZ_512]; /* project, generation, label; "" = free */
+    int count;
+} qg_count_slot_t;
+typedef struct {
+    qg_count_slot_t counts[QG_PLAN_COUNT_SLOTS];
+    int count_next;
+    uint64_t native[QG_PLAN_NATIVE_SLOTS]; /* 0 = free */
+    int native_next;
+} qg_plan_cache_t;
+
 struct cbm_mcp_server {
     cbm_store_t *store;     /* currently open project store (or NULL) */
     bool owns_store;        /* true if we opened the store */
@@ -1939,6 +1957,8 @@ struct cbm_mcp_server {
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
     cbm_mcp_tool_profile_t tool_profile;
     cbm_architecture_jobs_t *architecture_jobs;
+    cbm_mutex_t qg_plan_mutex;
+    qg_plan_cache_t qg_plan;
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -1947,6 +1967,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
         return NULL;
     }
     cbm_mutex_init(&srv->request_scope_mutex);
+    cbm_mutex_init(&srv->qg_plan_mutex);
     atomic_init(&srv->pipeline_cancel_requested, 0);
 
     /* If a store_path is given, open that project directly.
@@ -2140,6 +2161,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     free(srv->allowed_root);
     free(srv->active_request_id_str);
     cbm_mutex_destroy(&srv->request_scope_mutex);
+    cbm_mutex_destroy(&srv->qg_plan_mutex);
     free(srv);
 }
 
@@ -6127,52 +6149,167 @@ static char *query_graph_budget_floor_text(const cbm_cypher_result_t *result, in
     return cbm_sb_finish(&sb);
 }
 
-/* The engine ran out of its budget on a Neo4j-backed project: run the same
- * query in Neo4j, every node pattern scoped to this project's graph. On
- * success *result is replaced and carries a warning naming the switch; on
- * failure *result keeps a time-limit error that says why Neo4j could not
- * answer either. */
-static int query_graph_native_fallback(const char *project, const char *query,
-                                       cbm_cypher_result_t *result) {
-    char why[CBM_SZ_256] = "";
-    char *scoped = cbm_neo4j_scope_query(query, why, sizeof(why));
-    cbm_cypher_result_t nres = {0};
-    int rc = -1;
-    if (scoped) {
-        char db_path[CBM_SZ_1K];
-        project_db_path(project, db_path, sizeof(db_path));
-        rc = cbm_neo4j_native_query(db_path, project, scoped, 0, &nres);
-        free(scoped);
-        if (rc < 0) {
-            (void)snprintf(why, sizeof(why), "Neo4j rejected it: %.200s",
-                           nres.error ? nres.error : "query failed");
-        }
-    }
-    if (rc < 0) {
-        cbm_cypher_result_free(&nres);
-        char msg[CBM_SZ_1K];
-        (void)snprintf(msg, sizeof(msg),
-                       "query exceeded the execution time limit (%d s in the in-process engine) "
-                       "and could not be answered natively in Neo4j (%s) — narrow the pattern "
-                       "with a WHERE filter or LIMIT, or pass native:true with Neo4j Cypher "
-                       "($db/$gen scope this project's graph)",
-                       MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000, why[0] ? why : "unsupported");
-        free(result->error);
-        result->error = heap_strdup(msg);
+/* Run query in Neo4j itself, every node pattern scoped to this project's
+ * graph. 0 and *out filled, or -1 with why[] naming the reason. */
+static int query_graph_native_run(const char *project, const char *query, cbm_cypher_result_t *out,
+                                  char *why, size_t why_sz) {
+    why[0] = '\0';
+    char *scoped = cbm_neo4j_scope_query(query, why, why_sz);
+    if (!scoped) {
         return -1;
     }
-    cbm_cypher_result_free(result);
-    *result = nres;
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    int rc = cbm_neo4j_native_query(db_path, project, scoped, 0, out);
+    free(scoped);
+    if (rc < 0) {
+        (void)snprintf(why, why_sz, "Neo4j rejected it: %.200s",
+                       out->error ? out->error : "query failed");
+        cbm_cypher_result_free(out);
+        return -1;
+    }
+    return 0;
+}
+
+/* The warning a natively answered result carries: why Neo4j answered, and
+ * how its values differ from the engine's. */
+static void query_graph_native_note(cbm_cypher_result_t *result, const char *reason) {
     char note[CBM_SZ_1K];
     (void)snprintf(note, sizeof(note),
-                   "answered natively by Neo4j: in the in-process engine this query would "
-                   "read too much of the Neo4j-backed graph over HTTP (budget %d s). Values are "
-                   "Neo4j-typed (numbers compare as numbers, a missing property is null)%s%s",
-                   MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000, result->warning ? "; " : "",
-                   result->warning ? result->warning : "");
+                   "answered natively by Neo4j: %s. Values are "
+                   "Neo4j-typed (numbers compare as numbers, a missing property is null) and "
+                   "unaliased columns are named by Neo4j (count(n), not COUNT(n)): alias "
+                   "them (AS name) for stable names%s%s",
+                   reason, result->warning ? "; " : "", result->warning ? result->warning : "");
     free(result->warning);
     result->warning = heap_strdup(note);
-    return 0;
+}
+
+/* The engine ran out of its budget and Neo4j could not answer either. */
+static void query_graph_native_failed(cbm_cypher_result_t *result, const char *why) {
+    char msg[CBM_SZ_1K];
+    (void)snprintf(msg, sizeof(msg),
+                   "query exceeded the execution time limit (%d s in the in-process engine) "
+                   "and could not be answered natively in Neo4j (%s) — narrow the pattern "
+                   "with a WHERE filter or LIMIT, or pass native:true with Neo4j Cypher "
+                   "($db/$gen scope this project's graph)",
+                   MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000, why && why[0] ? why : "unsupported");
+    free(result->error);
+    result->error = heap_strdup(msg);
+}
+
+/* Rows the engine can pull from Neo4j and filter within its budget: a whole
+ * scan streams about 40k nodes/s over HTTP (817k nodes in 20 s), and matching
+ * relationships from each start node costs far more per row. A start scan
+ * above these limits cannot finish in MCP_QUERY_ENGINE_REMOTE_BUDGET_MS, so
+ * waiting for the engine only delays Neo4j's answer. */
+#define QG_PREDICT_SCAN_ROWS 350000
+#define QG_PREDICT_EXPAND_ROWS 100000
+
+static uint64_t qg_native_memo_key(const char *project, const char *query, const char *generation) {
+    uint64_t k = query_graph_params_hash(project, query, generation);
+    return k ? k : 1; /* 0 marks a free slot */
+}
+
+static bool qg_native_memo_has(cbm_mcp_server_t *srv, uint64_t key) {
+    bool hit = false;
+    cbm_mutex_lock(&srv->qg_plan_mutex);
+    for (int i = 0; i < QG_PLAN_NATIVE_SLOTS && !hit; i++) {
+        hit = srv->qg_plan.native[i] == key;
+    }
+    cbm_mutex_unlock(&srv->qg_plan_mutex);
+    return hit;
+}
+
+static void qg_native_memo_add(cbm_mcp_server_t *srv, uint64_t key) {
+    if (qg_native_memo_has(srv, key)) {
+        return;
+    }
+    cbm_mutex_lock(&srv->qg_plan_mutex);
+    srv->qg_plan.native[srv->qg_plan.native_next] = key;
+    srv->qg_plan.native_next = (srv->qg_plan.native_next + 1) % QG_PLAN_NATIVE_SLOTS;
+    cbm_mutex_unlock(&srv->qg_plan_mutex);
+}
+
+/* Nodes of label (NULL = all) in the project's current generation, cached
+ * per generation; -1 when the count cannot be read. */
+static int qg_label_count(cbm_mcp_server_t *srv, cbm_store_t *store, const char *project,
+                          const char *generation, const char *label) {
+    char key[CBM_SZ_512];
+    int kn = snprintf(key, sizeof(key), "%s\x1f%s\x1f%s%s", project, generation,
+                      label ? "L:" : "*", label ? label : "");
+    if (kn < 0 || (size_t)kn >= sizeof(key)) {
+        return -1;
+    }
+    int count = -1;
+    cbm_mutex_lock(&srv->qg_plan_mutex);
+    for (int i = 0; i < QG_PLAN_COUNT_SLOTS; i++) {
+        if (strcmp(srv->qg_plan.counts[i].key, key) == 0) {
+            count = srv->qg_plan.counts[i].count;
+            break;
+        }
+    }
+    cbm_mutex_unlock(&srv->qg_plan_mutex);
+    if (count >= 0) {
+        return count;
+    }
+    count = cbm_store_count_nodes_by_label(store, project, label);
+    if (count < 0) {
+        return -1;
+    }
+    cbm_mutex_lock(&srv->qg_plan_mutex);
+    qg_count_slot_t *slot = &srv->qg_plan.counts[srv->qg_plan.count_next];
+    srv->qg_plan.count_next = (srv->qg_plan.count_next + 1) % QG_PLAN_COUNT_SLOTS;
+    (void)snprintf(slot->key, sizeof(slot->key), "%s", key);
+    slot->count = count;
+    cbm_mutex_unlock(&srv->qg_plan_mutex);
+    return count;
+}
+
+/* true when the engine certainly cannot answer query within its budget on
+ * this Neo4j-backed project, so Neo4j should answer at once; reason[] says
+ * why. false (no prediction) whenever the work cannot be estimated. */
+static bool qg_predict_native(cbm_mcp_server_t *srv, cbm_store_t *store, const char *project,
+                              const char *generation, const char *query, uint64_t memo_key,
+                              char *reason, size_t reason_sz) {
+    if (qg_native_memo_has(srv, memo_key)) {
+        (void)snprintf(reason, reason_sz,
+                       "this query already ran past the in-process engine's %d s budget on "
+                       "this graph",
+                       MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000);
+        return true;
+    }
+    char label[CBM_SZ_256];
+    bool expands = false;
+    if (!generation[0] || !cbm_cypher_start_scan(query, label, sizeof(label), &expands)) {
+        return false;
+    }
+    int64_t rows = 0;
+    if (!label[0]) {
+        int c = qg_label_count(srv, store, project, generation, NULL);
+        if (c < 0) {
+            return false;
+        }
+        rows = c;
+    } else {
+        char *save = NULL;
+        for (char *tok = strtok_r(label, "|", &save); tok; tok = strtok_r(NULL, "|", &save)) {
+            int c = qg_label_count(srv, store, project, generation, tok);
+            if (c < 0) {
+                return false;
+            }
+            rows += c;
+        }
+    }
+    int64_t limit = expands ? QG_PREDICT_EXPAND_ROWS : QG_PREDICT_SCAN_ROWS;
+    if (rows <= limit) {
+        return false;
+    }
+    (void)snprintf(reason, reason_sz,
+                   "the in-process engine would first read %lld nodes of this Neo4j-backed graph "
+                   "over HTTP, more than it can within its %d s budget",
+                   (long long)rows, MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000);
+    return true;
 }
 
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
@@ -6295,11 +6432,61 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
          * touches much of it (a full count, an aggregation, a hub's callers)
          * can take minutes. Give it a short budget; if it runs out, answer
          * the same query inside Neo4j, scoped to this project's graph. */
-        cbm_cypher_set_budget_ms(MCP_QUERY_ENGINE_REMOTE_BUDGET_MS);
-        rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
-        cbm_cypher_set_budget_ms(0);
-        if (rc < 0 && result.timed_out) {
-            rc = query_graph_native_fallback(effective_project, query, &result);
+        /* A query that cannot be scoped safely has no fallback: it keeps the
+         * engine's full budget, exactly as before the fallback existed. */
+        char *scopable = cbm_neo4j_scope_query(query, NULL, 0);
+        bool can_fall_back = scopable != NULL;
+        free(scopable);
+        /* When the engine's first scan alone is more than it can read in
+         * its budget (or this query already needed Neo4j), ask Neo4j first
+         * instead of waiting out the budget. */
+        uint64_t memo_key = qg_native_memo_key(effective_project, query, generation);
+        char reason[CBM_SZ_512] = "";
+        char native_why[CBM_SZ_256] = "";
+        bool predicted = can_fall_back &&
+                         qg_predict_native(srv, store, effective_project, generation, query,
+                                           memo_key, reason, sizeof(reason));
+        rc = -1;
+        if (predicted) {
+            rc = query_graph_native_run(effective_project, query, &result, native_why,
+                                        sizeof(native_why));
+            if (rc == 0) {
+                query_graph_native_note(&result, reason);
+                cbm_store_note_remote_queries(store, 1);
+            }
+        }
+        if (rc < 0) {
+            /* No prediction, or Neo4j refused the query: the engine answers,
+             * with Neo4j as the fallback if it runs out of budget. */
+            memset(&result, 0, sizeof(result));
+            if (can_fall_back) {
+                cbm_cypher_set_budget_ms(MCP_QUERY_ENGINE_REMOTE_BUDGET_MS);
+            }
+            rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
+            cbm_cypher_set_budget_ms(0);
+            if (can_fall_back && rc < 0 && result.timed_out) {
+                if (predicted) {
+                    query_graph_native_failed(&result, native_why); /* already tried */
+                } else {
+                    cbm_cypher_result_t nres = {0};
+                    if (query_graph_native_run(effective_project, query, &nres, native_why,
+                                               sizeof(native_why)) == 0) {
+                        cbm_cypher_result_free(&result);
+                        result = nres;
+                        char why_note[CBM_SZ_256];
+                        (void)snprintf(why_note, sizeof(why_note),
+                                       "in the in-process engine this query would read too much "
+                                       "of the Neo4j-backed graph over HTTP (budget %d s)",
+                                       MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000);
+                        query_graph_native_note(&result, why_note);
+                        cbm_store_note_remote_queries(store, 1);
+                        qg_native_memo_add(srv, memo_key);
+                        rc = 0;
+                    } else {
+                        query_graph_native_failed(&result, native_why);
+                    }
+                }
+            }
         }
     } else {
         rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
@@ -15979,8 +16166,9 @@ static bool search_window_alloc(search_window_t *w) {
 }
 
 /* Read every window file's nodes in one batched store call and slice them
- * per file. A failed read leaves the files without nodes, exactly as the
- * per-file read ignored its failures. */
+ * per file. false when the read fails: one failed batch would otherwise
+ * strip the graph results of up to SEARCH_NODE_WINDOW files while the reply
+ * still claimed to be complete. */
 static bool search_window_load_nodes(search_window_t *w, cbm_store_t *store, const char *project) {
     if (!store || w->n == 0) {
         return true;
@@ -16005,8 +16193,13 @@ static bool search_window_load_nodes(search_window_t *w, cbm_store_t *store, con
     cbm_node_t *nodes = NULL;
     int node_count = 0;
     if (nw > 0 &&
-        cbm_store_find_nodes_by_files(store, project, want, nw, &nodes, &node_count) ==
+        cbm_store_find_nodes_by_files(store, project, want, nw, &nodes, &node_count) !=
             CBM_STORE_OK) {
+        free(want);
+        free(want_entry);
+        return false;
+    }
+    if (nw > 0) {
         /* grouped by file in request order, so one forward walk slices them */
         int at = 0;
         for (int k = 0; k < nw; k++) {
@@ -17359,8 +17552,13 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
         }
-        return cbm_mcp_text_result("search failed before the complete result set was scanned",
-                                   true);
+        char msg[CBM_SZ_1K];
+        const char *store_err = store ? cbm_store_error(store) : NULL;
+        (void)snprintf(msg, sizeof(msg),
+                       "search failed before the complete result set was scanned%s%s",
+                       store_err && store_err[0] ? ": " : "",
+                       store_err && store_err[0] ? store_err : "");
+        return cbm_mcp_text_result(msg, true);
     }
 
     /* ── Phase 2+3: degree expansion + global graph ranking ─── */
@@ -19547,6 +19745,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     /* The opt-in walk has no result ceiling, so it never saturates: it answers
      * completely or the request fails. It stays open while `via` is rendered. */
     cbm_impact_walk_t *impact_walk = NULL;
+    char bfs_error[CBM_SZ_1K];
     const char *walk_error =
         seed_rows.config_failed
             ? "config_invalid: could not read a valid project test configuration"
@@ -19560,8 +19759,21 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                          "via for the bounded default traversal";
         }
     } else if (!walk_error && want_symbols && seed_count > 0) {
-        (void)cbm_store_bfs_multi(store, seeds, seed_count, direction, NULL, 0, depth,
-                                  MCP_BFS_LIMIT_MAX, &impact, &engine_saturated);
+        /* A failed traversal must not read as "nothing else depends on this":
+         * on a Neo4j-backed project one failed batched row read used to leave
+         * impacted_total 0 / eq. Fail the request instead, like the walk. */
+        if (cbm_store_bfs_multi(store, seeds, seed_count, direction, NULL, 0, depth,
+                                MCP_BFS_LIMIT_MAX, &impact, &engine_saturated) != CBM_STORE_OK) {
+            cbm_store_traverse_free(&impact);
+            memset(&impact, 0, sizeof(impact));
+            engine_saturated = false;
+            const char *store_err = cbm_store_error(store);
+            snprintf(bfs_error, sizeof(bfs_error),
+                     "impact_traversal_failed: the impact traversal could not be completed%s%s "
+                     "— no partial answer is returned; rerun",
+                     store_err && store_err[0] ? ": " : "", store_err ? store_err : "");
+            walk_error = bfs_error;
+        }
     }
     const cbm_impact_walk_t *via_walk = walk_req.via ? impact_walk : NULL;
     char walk_types_text[DETECT_WALK_TYPE_MAX * DETECT_WALK_TYPE_LEN] = "";

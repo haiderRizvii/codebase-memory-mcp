@@ -32,8 +32,8 @@ int cbm_neo4j_native_query(const char *db_path, const char *project, const char 
                            int max_rows, cbm_cypher_result_t *out);
 
 /* query_graph's engine dialect rewritten for Neo4j: every node pattern is
- * scoped to the project's current graph ({db: $db, gen: $gen} added to its
- * property map), so cbm_neo4j_native_query can run it. Returns a malloc'd
+ * scoped to the project's current graph (:CbmNode and {db: $db, gen: $gen,
+ * project: $project} added), so cbm_neo4j_native_query can run it. Returns a malloc'd
  * query, or NULL (why says so) when the query cannot be scoped safely, e.g.
  * it reads the engine-only virtual properties in_degree / out_degree. */
 char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz);

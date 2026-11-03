@@ -6891,3 +6891,40 @@ void cbm_cypher_result_free(cbm_cypher_result_t *r) {
     free(r->error);
     memset(r, 0, sizeof(*r));
 }
+
+int cbm_cypher_start_scan(const char *query, char *label, size_t label_sz, bool *expands) {
+    if (label && label_sz > 0) {
+        label[0] = '\0';
+    }
+    if (expands) {
+        *expands = false;
+    }
+    if (!query || !label || label_sz == 0) {
+        return 0;
+    }
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    if (cbm_cypher_parse(query, &q, &err) != 0 || !q) {
+        free(err);
+        cbm_query_free(q);
+        return 0;
+    }
+    free(err);
+    int known = 0;
+    /* One MATCH chain only: a UNION part or an UNWIND source starts elsewhere. */
+    if (!q->union_next && !q->unwind_expr && q->pattern_count > 0 &&
+        q->patterns[0].node_count > 0 && !(q->pattern_optional && q->pattern_optional[0])) {
+        cypher_plan_seed_from_selective_end(q); /* the start execute_single uses */
+        const cbm_node_pattern_t *start = &q->patterns[0].nodes[0];
+        const char *l = start->label ? start->label : "";
+        if (strlen(l) < label_sz) {
+            snprintf(label, label_sz, "%s", l);
+            if (expands) {
+                *expands = q->patterns[0].rel_count > 0 || q->pattern_count > 1;
+            }
+            known = 1;
+        }
+    }
+    cbm_query_free(q);
+    return known;
+}

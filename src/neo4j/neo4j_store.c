@@ -19,6 +19,15 @@
 #include <string.h>
 
 #define N4S_GEN_MAX 128
+/* Server-side limit for user (native / fallback) queries: below the HTTP
+ * client's 120 s I/O timeout, so Neo4j stops the query itself and the reply
+ * says so, instead of the client giving up while the server keeps working. */
+#define N4S_NATIVE_MAX_EXEC_MS 60000
+/* Server-side limit for the store's own reads (batched node/edge reads, scan
+ * pages, counts): the largest measured on an 817k-node project took 6.2 s,
+ * so a read still running after a minute is hung, and its error should not
+ * wait out the 120 s I/O timeout. */
+#define N4S_READ_MAX_EXEC_MS 60000
 #define N4S_ID_CHUNK 5000
 
 /* Node columns, in cbm_node_t order. */
@@ -859,30 +868,48 @@ static int op_scan_nodes(void *ctx, const char *project, const char *label, bool
                          const char *after_file, int64_t after_id, int max, cbm_node_t **out,
                          int *count) {
     n4s_ctx_t *x = ctx;
-    /* Each page seeks the index whose order it returns ((db, gen, id) or
-     * (db, gen, file_path)), so a page costs its own rows, not a re-sort of
-     * the whole label or graph. */
-    const char *cypher =
-        label ? "MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, id) "
-                "WHERE n.db = $db AND n.gen = $gen AND n.id > $after_id AND n.label = $label "
-                "AND ($project IS NULL OR n.project = $project) "
-                "RETURN " N4S_NODE_COLS("n") " ORDER BY n.id LIMIT $max"
-              : "MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, file_path) "
-                "WHERE n.db = $db AND n.gen = $gen AND n.file_path >= $after_file "
-                "AND ($keyed = false OR n.file_path > $after_file OR n.id > $after_id) "
-                "AND ($project IS NULL OR n.project = $project) "
-                "RETURN " N4S_NODE_COLS("n") " ORDER BY n.file_path, n.id LIMIT $max";
-    n4s_q_t q;
-    if (q_begin(x, &q, cypher) != 0) {
-        return CBM_STORE_ERR;
+    /* A full scan seeks (db, gen, file_path) and orders by the whole index
+     * key (db and gen are fixed by the seek, so the order is (file_path,
+     * id)): the planner then reads the index in order and sorts only rows
+     * of equal file_path (PartialTop), so a page reads about its own rows.
+     * ORDER BY n.file_path, n.id alone made it read and sort every remaining
+     * row of the project on every page. A label scan seeks (db, gen, label)
+     * and sorts that label's remaining rows by id: a rare label costs its
+     * own size, not a walk of the whole graph in id order. */
+#define N4S_SCAN_LABEL_WHERE                                                       \
+    "WHERE n.db = $db AND n.gen = $gen AND n.id > $after_id AND n.label = $label "  \
+    "AND ($project IS NULL OR n.project = $project) "                              \
+    "RETURN " N4S_NODE_COLS("n") " ORDER BY n.id LIMIT $max"
+#define N4S_SCAN_ALL_WHERE                                                         \
+    "WHERE n.db = $db AND n.gen = $gen AND n.file_path >= $after_file "            \
+    "AND ($keyed = false OR n.file_path > $after_file OR n.id > $after_id) "       \
+    "AND ($project IS NULL OR n.project = $project) "                              \
+    "RETURN " N4S_NODE_COLS("n") " ORDER BY n.db, n.gen, n.file_path, n.id LIMIT $max"
+    /* With the hint, a page that the planner cannot serve from the index
+     * (still populating, dropped by hand) is an error, not a slow scan:
+     * retry such a page once without it. */
+    static const char *const hinted[2] = {
+        "MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, file_path) " N4S_SCAN_ALL_WHERE,
+        "MATCH (n:CbmNode) USING INDEX n:CbmNode(db, gen, label) " N4S_SCAN_LABEL_WHERE};
+    static const char *const plain[2] = {"MATCH (n:CbmNode) " N4S_SCAN_ALL_WHERE,
+                                         "MATCH (n:CbmNode) " N4S_SCAN_LABEL_WHERE};
+    int rc = CBM_STORE_ERR;
+    for (int attempt = 0; attempt < 2 && rc != CBM_STORE_OK; attempt++) {
+        n4s_q_t q;
+        if (q_begin(x, &q, (attempt == 0 ? hinted : plain)[label ? 1 : 0]) != 0) {
+            return CBM_STORE_ERR;
+        }
+        q_str(&q, "project", project);
+        q_str(&q, "label", label);
+        yyjson_mut_obj_add_bool(q.b.doc, q.params, "keyed", keyed);
+        q_str(&q, "after_file", after_file ? after_file : "");
+        q_int(&q, "after_id", keyed ? after_id : INT64_MIN);
+        q_int(&q, "max", max);
+        rc = collect_nodes(x, &q, out, count);
     }
-    q_str(&q, "project", project);
-    q_str(&q, "label", label);
-    yyjson_mut_obj_add_bool(q.b.doc, q.params, "keyed", keyed);
-    q_str(&q, "after_file", after_file ? after_file : "");
-    q_int(&q, "after_id", keyed ? after_id : INT64_MIN);
-    q_int(&q, "max", max);
-    return collect_nodes(x, &q, out, count);
+    return rc;
+#undef N4S_SCAN_LABEL_WHERE
+#undef N4S_SCAN_ALL_WHERE
 }
 
 static int op_find_edges_by_type(void *ctx, const char *project, const char *type, cbm_edge_t **out,
@@ -911,6 +938,11 @@ static int op_count(void *ctx, cbm_remote_count_t kind, const char *project, con
     case CBM_REMOTE_COUNT_EDGES:
         cypher = "MATCH (a:CbmNode {db: $db, gen: $gen})-[r]->() "
                  "WHERE $project IS NULL OR a.project = $project RETURN count(r)";
+        break;
+    case CBM_REMOTE_COUNT_NODES_BY_LABEL:
+        /* seeks the (db, gen, label) index */
+        cypher = "MATCH (n:CbmNode {db: $db, gen: $gen, label: $arg}) "
+                 "WHERE $project IS NULL OR n.project = $project RETURN count(n)";
         break;
     case CBM_REMOTE_COUNT_EDGES_BY_TYPE:
         cypher = "MATCH (a:CbmNode {db: $db, gen: $gen})-[r]->() "
@@ -1835,6 +1867,13 @@ static n4s_ctx_t *ctx_open(const char *db_path, const char *project, char *err, 
         free(x);
         return NULL;
     }
+    /* Every read of the store runs in Neo4j's READ access mode: the server
+     * refuses any write sent on this connection. */
+    if (cbm_neo4j_set_read_only(x->c, N4S_READ_MAX_EXEC_MS) != 0) {
+        cbm_neo4j_close(x->c);
+        free(x);
+        return NULL;
+    }
     (void)snprintf(x->db, sizeof(x->db), "%s", project);
     cbm_neo4j_batch_t b;
     cbm_neo4j_result_t r;
@@ -1925,15 +1964,36 @@ static void native_fail(cbm_cypher_result_t *out, const char *msg) {
 /* query_graph is a read tool: refuse Cypher that could write. Keywords are
  * matched as whole words outside string literals, comments and backticks. */
 static const char *native_write_keyword(const char *q) {
-    static const char *const kw[] = {"CREATE", "MERGE",   "DELETE", "DETACH", "SET", "REMOVE",
-                                     "DROP",   "FOREACH", "LOAD",   "CALL",   NULL};
+    /* The server enforces READ access mode on these transactions
+     * (cbm_neo4j_set_read_only); this keyword check only gives an early,
+     * clear refusal. It lexes like Neo4j: block and line comments, string
+     * escapes, backtick identifiers (no escapes; `` is a literal backtick). */
+    static const char *const kw[] = {"CREATE", "MERGE",  "DELETE", "DETACH", "SET",    "REMOVE",
+                                     "DROP",   "FOREACH", "LOAD",  "CALL",   "INSERT", "USE",
+                                     "ALTER",  "GRANT",  "DENY",   "REVOKE", "RENAME", NULL};
     for (const char *p = q; *p;) {
-        if (*p == '\'' || *p == '"' || *p == '`') {
+        if (*p == '\'' || *p == '"') {
             char quote = *p++;
             while (*p && *p != quote) {
                 p += (*p == '\\' && p[1]) ? 2 : 1;
             }
             p += *p ? 1 : 0;
+            continue;
+        }
+        if (*p == '`') {
+            p++;
+            while (*p && *p != '`') {
+                p++;
+            }
+            p += *p ? 1 : 0;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) {
+                p++;
+            }
+            p += *p ? 2 : 0;
             continue;
         }
         if (p[0] == '/' && p[1] == '/') {
@@ -2009,6 +2069,39 @@ static int native_rows(cbm_neo4j_result_t *r, int max_rows, cbm_cypher_result_t 
 }
 
 /* ── Engine dialect → scoped Neo4j Cypher ──────────────────────── */
+
+
+/* True when q (outside string literals) holds syntax the engine's lexer and
+ * Neo4j's read differently, so a token-level rewrite of what the engine
+ * saw would not be what Neo4j runs: comments (the engine drops `--` to the
+ * end of the line, where Neo4j sees an undirected relationship), and
+ * backtick identifiers. Sets *what. */
+static bool scope_unsafe_syntax(const char *q, const char **what) {
+    for (const char *p = q; *p;) {
+        if (*p == '\'' || *p == '"') {
+            char quote = *p++;
+            while (*p && *p != quote) {
+                p += (*p == '\\' && p[1]) ? 2 : 1;
+            }
+            p += *p ? 1 : 0;
+            continue;
+        }
+        if (p[0] == '-' && p[1] == '-') {
+            *what = "'--' (a comment to the engine, a relationship to Neo4j)";
+            return true;
+        }
+        if ((p[0] == '/' && p[1] == '/') || (p[0] == '/' && p[1] == '*')) {
+            *what = "a comment";
+            return true;
+        }
+        if (*p == '`') {
+            *what = "a backtick identifier";
+            return true;
+        }
+        p++;
+    }
+    return false;
+}
 
 /* Does tokens[i] ('(') open a node pattern `( [var] (:L(|L)*)* [{...}] )`?
  * On success *brace is the '{' index (-1 if none) and *close the ')'. */
@@ -2088,6 +2181,13 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
     if (!query) {
         return NULL;
     }
+    const char *unsafe = NULL;
+    if (scope_unsafe_syntax(query, &unsafe)) {
+        if (why) {
+            (void)snprintf(why, why_sz, "it contains %s", unsafe);
+        }
+        return NULL;
+    }
     cbm_lex_result_t lx = {0};
     if (cbm_lex(query, &lx) < 0 || lx.error) {
         if (why) {
@@ -2115,6 +2215,16 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
                    ty == TOK_ORDER || ty == TOK_UNION) {
             in_match = false;
         }
+        /* =~ is POSIX ERE in the engine and Java regex in Neo4j: the same
+         * pattern can match different strings ([[:digit:]] matches nothing). */
+        if (ty == TOK_EQTILDE) {
+            if (why) {
+                (void)snprintf(why, why_sz, "regular expressions (=~) differ between the engine "
+                                            "and Neo4j");
+            }
+            ok = false;
+            break;
+        }
         /* n.in_degree / n.out_degree are computed by the engine, not stored. */
         if (ty == TOK_DOT && i + 1 < count &&
             (tok_is_word(&t[i + 1], "in_degree") || tok_is_word(&t[i + 1], "out_degree"))) {
@@ -2125,6 +2235,20 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
             ok = false;
             break;
         }
+        /* {db: ...} / {gen: ...} written by the query would sit next to the
+         * injected scope keys (Neo4j accepts a duplicate key silently). */
+        if (ty == TOK_LBRACE || ty == TOK_COMMA) {
+            if (i + 2 < count && t[i + 2].type == TOK_COLON &&
+                (tok_is_word(&t[i + 1], "db") || tok_is_word(&t[i + 1], "gen") ||
+                 tok_is_word(&t[i + 1], "project"))) {
+                if (why) {
+                    (void)snprintf(why, why_sz, "it sets the reserved property %s",
+                                   t[i + 1].text);
+                }
+                ok = false;
+                break;
+            }
+        }
         if (ty != TOK_LPAREN) {
             continue;
         }
@@ -2134,6 +2258,13 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
             continue;
         }
         cbm_token_type_t prev = i > 0 ? t[i - 1].type : TOK_EOF;
+        /* count(n) - 1, toLower(x) ...: a call's parentheses, not a node. */
+        if (prev == TOK_IDENT || prev == TOK_COUNT || prev == TOK_SUM || prev == TOK_AVG ||
+            prev == TOK_MIN_KW || prev == TOK_MAX_KW || prev == TOK_COLLECT ||
+            prev == TOK_TOLOWER || prev == TOK_TOUPPER || prev == TOK_TOSTRING ||
+            prev == TOK_EXISTS) {
+            continue;
+        }
         cbm_token_type_t next = close + 1 < count ? t[close + 1].type : TOK_EOF;
         bool pattern_context = prev == TOK_MATCH || prev == TOK_DASH || prev == TOK_GT ||
                                prev == TOK_LT || (prev == TOK_COMMA && in_match) ||
@@ -2189,10 +2320,11 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
         if (brace >= 0) {
             bool empty = t[brace + 1].type == TOK_RBRACE;
             ins[nins].pos = t[brace].pos + 1;
-            ins[nins].text = empty ? "db: $db, gen: $gen" : "db: $db, gen: $gen, ";
+            ins[nins].text = empty ? "db: $db, gen: $gen, project: $project"
+                                   : "db: $db, gen: $gen, project: $project, ";
         } else {
             ins[nins].pos = t[close].pos;
-            ins[nins].text = " {db: $db, gen: $gen}";
+            ins[nins].text = " {db: $db, gen: $gen, project: $project}";
         }
         ins[nins].seq = nins;
         nins++;
@@ -2260,6 +2392,12 @@ int cbm_neo4j_native_query(const char *db_path, const char *project, const char 
         native_fail(out, status == CBM_NEO4J_ATTACH_NONE
                              ? "project is not Neo4j-backed (index it with graph_db first)"
                              : err);
+        return -1;
+    }
+    /* Neo4j itself refuses writes and stops the query after the limit. */
+    if (cbm_neo4j_set_read_only(x->c, N4S_NATIVE_MAX_EXEC_MS) != 0) {
+        op_close(x);
+        native_fail(out, "out of memory");
         return -1;
     }
     n4s_q_t q;

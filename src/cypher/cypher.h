@@ -359,6 +359,15 @@ void cbm_cypher_set_budget_ms(int64_t budget_ms);
 /* Free a query result. */
 void cbm_cypher_result_free(cbm_cypher_result_t *r);
 
+/* What the engine scans first for query: every node of the start pattern's
+ * label (after its selective-end planning), or every node of the project when
+ * that pattern has no label. label = "" (no label), "A" or "A|B"; *expands is
+ * true when relationships or further patterns are matched from those nodes.
+ * 1 when known; 0 when the query does not parse or has no single start scan
+ * (UNION, UNWIND, OPTIONAL first pattern). Lets a caller estimate the work
+ * before running it. */
+int cbm_cypher_start_scan(const char *query, char *label, size_t label_sz, bool *expands);
+
 /* Convenience: lex + parse in one step. */
 int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error);
 
