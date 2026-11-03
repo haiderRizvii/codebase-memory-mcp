@@ -45,6 +45,16 @@ int cbm_neo4j_http_post(cbm_neo4j_http_t *h, const char *path, const char *body,
 
 void cbm_neo4j_http_close(cbm_neo4j_http_t *h);
 
+/* Headers ("Name: value\r\n" each) sent with every later request on h;
+ * NULL or "" removes them. 0, or -1 when out of memory. */
+int cbm_neo4j_http_set_extra_headers(cbm_neo4j_http_t *h, const char *headers);
+
+/* Longest time a request on h waits for the server while the server is still
+ * answering new connections (a dead server fails the request after about
+ * 15 s either way); <= 0 restores the default (120 s). Set it a little above
+ * a server-side time limit the requests carry. */
+void cbm_neo4j_http_set_max_wait(cbm_neo4j_http_t *h, int max_wait_ms);
+
 /* Tests: decode a chunked body that arrives `step` bytes at a time, as the
  * socket reader does. 0 with *out (malloc'd, decoded bytes first), *consumed
  * (raw bytes used) and *buffered (raw bytes read so far; those after

@@ -154,6 +154,7 @@ struct cbm_store {
     void *remote_ctx;
     /* Per-request backend report (cbm_store_backend_usage). */
     uint64_t remote_queries_base;
+    uint64_t remote_queries_extra; /* sent outside the backend (native queries) */
     int local_graph_reads;
     char local_graph_what[160];
 
@@ -244,6 +245,12 @@ void cbm_store_note_local_graph_read(cbm_store_t *s, const char *what) {
     }
 }
 
+void cbm_store_note_remote_queries(cbm_store_t *s, uint64_t n) {
+    if (s && s->remote_ops) {
+        s->remote_queries_extra += n;
+    }
+}
+
 static uint64_t store_remote_queries(const cbm_store_t *s) {
     return (s && s->remote_ops && s->remote_ops->queries) ? s->remote_ops->queries(s->remote_ctx)
                                                           : 0;
@@ -254,7 +261,8 @@ void cbm_store_backend_usage(const cbm_store_t *s, cbm_store_backend_usage_t *ou
     if (!s || !s->remote_ops) {
         return;
     }
-    out->remote_queries = store_remote_queries(s) - s->remote_queries_base;
+    out->remote_queries = store_remote_queries(s) - s->remote_queries_base +
+                          s->remote_queries_extra;
     out->local_reads = s->local_graph_reads;
     snprintf(out->local_what, sizeof(out->local_what), "%s", s->local_graph_what);
 }
@@ -264,6 +272,7 @@ void cbm_store_backend_usage_reset(cbm_store_t *s) {
         return;
     }
     s->remote_queries_base = store_remote_queries(s);
+    s->remote_queries_extra = 0;
     s->local_graph_reads = 0;
     s->local_graph_what[0] = '\0';
 }
@@ -3772,7 +3781,7 @@ static void node_scan_bind(cbm_store_node_scan_t *scan, sqlite3_stmt *stmt, node
 
 /* One page of the current phase into out[0..max). A short page ends the
  * phase; the statement is reset before returning either way. */
-#define NODE_SCAN_REMOTE_PAGE 20000
+#define NODE_SCAN_REMOTE_PAGE 100000
 static int g_node_scan_remote_page = NODE_SCAN_REMOTE_PAGE;
 
 void cbm_store_test_set_remote_scan_page(int rows) {
@@ -4191,6 +4200,33 @@ int cbm_store_get_file_outline(cbm_store_t *s, const char *project, const char *
     *out = rows;
     *count = n;
     return CBM_STORE_OK;
+}
+
+int cbm_store_count_nodes_by_label(cbm_store_t *s, const char *project, const char *label) {
+    if (!label) {
+        return cbm_store_count_nodes(s, project);
+    }
+    if (s && s->remote_ops) {
+        return remote_status(s, s->remote_ops->count(s->remote_ctx, CBM_REMOTE_COUNT_NODES_BY_LABEL,
+                                                     project, label));
+    }
+    if (!s || !s->db) {
+        return 0;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND label = ?2;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "count_nodes_by_label");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, 2, label);
+    int count = CBM_STORE_ERR;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
 }
 
 int cbm_store_count_nodes(cbm_store_t *s, const char *project) {

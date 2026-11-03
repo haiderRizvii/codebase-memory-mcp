@@ -63,6 +63,13 @@ typedef struct cbm_neo4j cbm_neo4j_t;
 /* Create a client (no network I/O yet). Returns NULL with err on bad URL. */
 cbm_neo4j_t *cbm_neo4j_connect(const cbm_neo4j_config_t *cfg, char *err, size_t err_sz);
 void cbm_neo4j_close(cbm_neo4j_t *c);
+
+/* Every later transaction on c runs in Neo4j's READ access mode -- the
+ * server refuses any write (Neo.ClientError.Statement.AccessMode) -- and,
+ * when max_execution_ms > 0, is terminated by the server after that long
+ * (HTTP header max-execution-time); the client then waits at most 10 s
+ * beyond that for a reply. For connections that only read. */
+int cbm_neo4j_set_read_only(cbm_neo4j_t *c, int max_execution_ms);
 const char *cbm_neo4j_error(const cbm_neo4j_t *c);
 const char *cbm_neo4j_uri(const cbm_neo4j_t *c);
 

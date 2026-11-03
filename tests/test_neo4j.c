@@ -21,6 +21,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 /* ── URL parsing ─────────────────────────────────────────────────── */
 
@@ -566,7 +572,12 @@ TEST(neo4j_native_query_is_read_only) {
         "MATCH (n) DETACH DELETE n",  "create (n:X)",
         "MATCH (n) SET n.x = 1",      "MERGE (a:A)",
         "CALL db.clearQueryCaches()", "LOAD CSV FROM 'x' AS r RETURN r",
-        "MATCH (n) REMOVE n.x",       "FOREACH (x IN [1] | CREATE (:A))"};
+        "MATCH (n) REMOVE n.x",       "FOREACH (x IN [1] | CREATE (:A))",
+        /* a quote inside a block comment must not open a string (C1) */
+        "MATCH (n) /* ' */ DETACH DELETE n /* ' */",
+        /* a backslash inside a backtick identifier is not an escape */
+        "MATCH (n) WITH n AS `a\\` DETACH DELETE n RETURN `x`",
+        "INSERT (:A)", "USE other MATCH (n) RETURN n"};
     for (size_t i = 0; i < sizeof(writes) / sizeof(writes[0]); i++) {
         cbm_cypher_result_t r;
         ASSERT_EQ(cbm_neo4j_native_query("/nonexistent/x.db", "p", writes[i], 0, &r), -1);
@@ -1469,30 +1480,48 @@ static int scope_expect(const char *in, const char *want) {
 
 TEST(neo4j_scope_query_scopes_every_node_pattern) {
     SCOPE_EXPECT("MATCH (n) RETURN count(n)",
-                 "MATCH (n:CbmNode {db: $db, gen: $gen}) RETURN count(n)");
+                 "MATCH (n:CbmNode {db: $db, gen: $gen, project: $project}) RETURN count(n)");
+    /* regex dialects differ (POSIX ERE vs Java) */
+    SCOPE_EXPECT("MATCH (n) WHERE n.name =~ 'v[[:digit:]]+' RETURN count(n)", NULL);
+    SCOPE_EXPECT("MATCH (n {project: 'other'}) RETURN n", NULL);
     SCOPE_EXPECT("MATCH ()-[r:CALLS]->() RETURN count(r)",
-                 "MATCH (:CbmNode {db: $db, gen: $gen})-[r:CALLS]->(:CbmNode {db: $db, gen: $gen}) "
+                 "MATCH (:CbmNode {db: $db, gen: $gen, project: $project})-[r:CALLS]->(:CbmNode {db: $db, gen: $gen, project: $project}) "
                  "RETURN count(r)");
     SCOPE_EXPECT("MATCH (a:Function {name: 'x'})<-[:CALLS]-(b) RETURN b.name",
-                 "MATCH (a:CbmNode:Function {db: $db, gen: $gen, name: 'x'})<-[:CALLS]-"
-                 "(b:CbmNode {db: $db, gen: $gen}) RETURN b.name");
+                 "MATCH (a:CbmNode:Function {db: $db, gen: $gen, project: $project, name: 'x'})<-[:CALLS]-"
+                 "(b:CbmNode {db: $db, gen: $gen, project: $project}) RETURN b.name");
     SCOPE_EXPECT("MATCH (a), (b:File|Folder) RETURN a",
-                 "MATCH (a:CbmNode {db: $db, gen: $gen}), "
-                 "(b:CbmNode&(File|Folder) {db: $db, gen: $gen}) RETURN a");
-    SCOPE_EXPECT("MATCH (n {}) RETURN n", "MATCH (n :CbmNode {db: $db, gen: $gen}) RETURN n");
+                 "MATCH (a:CbmNode {db: $db, gen: $gen, project: $project}), "
+                 "(b:CbmNode&(File|Folder) {db: $db, gen: $gen, project: $project}) RETURN a");
+    SCOPE_EXPECT("MATCH (n {}) RETURN n", "MATCH (n :CbmNode {db: $db, gen: $gen, project: $project}) RETURN n");
     SCOPE_EXPECT("MATCH (a) OPTIONAL MATCH (a)-[:USAGE]->(u) RETURN a.name, u.name",
-                 "MATCH (a:CbmNode {db: $db, gen: $gen}) OPTIONAL MATCH "
-                 "(a:CbmNode {db: $db, gen: $gen})-[:USAGE]->(u:CbmNode {db: $db, gen: $gen}) "
+                 "MATCH (a:CbmNode {db: $db, gen: $gen, project: $project}) OPTIONAL MATCH "
+                 "(a:CbmNode {db: $db, gen: $gen, project: $project})-[:USAGE]->(u:CbmNode {db: $db, gen: $gen, project: $project}) "
                  "RETURN a.name, u.name");
     /* a pattern predicate in WHERE is a pattern too; a call is not */
     SCOPE_EXPECT("MATCH (a) WHERE NOT (a)<-[:CALLS]-() RETURN count(a)",
-                 "MATCH (a:CbmNode {db: $db, gen: $gen}) WHERE NOT "
-                 "(a:CbmNode {db: $db, gen: $gen})<-[:CALLS]-(:CbmNode {db: $db, gen: $gen}) "
+                 "MATCH (a:CbmNode {db: $db, gen: $gen, project: $project}) WHERE NOT "
+                 "(a:CbmNode {db: $db, gen: $gen, project: $project})<-[:CALLS]-(:CbmNode {db: $db, gen: $gen, project: $project}) "
                  "RETURN count(a)");
     /* parentheses inside string literals are text */
     SCOPE_EXPECT("MATCH (n) WHERE n.name = '(x)' RETURN n",
-                 "MATCH (n:CbmNode {db: $db, gen: $gen}) WHERE n.name = '(x)' RETURN n");
+                 "MATCH (n:CbmNode {db: $db, gen: $gen, project: $project}) WHERE n.name = '(x)' RETURN n");
     SCOPE_EXPECT("MATCH (n:A:B|C) RETURN n", NULL);
+    /* the engine drops `--` to the end of the line; Neo4j reads a pattern */
+    SCOPE_EXPECT("MATCH (a)-[:CALLS]->(b) RETURN count(b) -- (x) RETURN 1", NULL);
+    SCOPE_EXPECT("MATCH (a)--(b) RETURN count(b)", NULL);
+    SCOPE_EXPECT("MATCH (n) /* x */ RETURN n", NULL);
+    SCOPE_EXPECT("MATCH (n) // x\nRETURN n", NULL);
+    SCOPE_EXPECT("MATCH (`n`) RETURN `n`", NULL);
+    /* the scope keys cannot be supplied (or overridden) by the query */
+    SCOPE_EXPECT("MATCH (n {db: 'other'}) RETURN n", NULL);
+    SCOPE_EXPECT("MATCH (n {name: 'x', gen: 1}) RETURN n", NULL);
+    /* '--' inside a string is text */
+    SCOPE_EXPECT("MATCH (n) WHERE n.name = 'a--b' RETURN n",
+                 "MATCH (n:CbmNode {db: $db, gen: $gen, project: $project}) WHERE n.name = 'a--b' RETURN n");
+    /* a call's parentheses are not a node pattern */
+    SCOPE_EXPECT("MATCH (n) RETURN count(n) - 1",
+                 "MATCH (n:CbmNode {db: $db, gen: $gen, project: $project}) RETURN count(n) - 1");
     /* engine-only virtual properties have no Neo4j value */
     SCOPE_EXPECT("MATCH (n:Function) WHERE n.in_degree = '0' RETURN n.name", NULL);
     SCOPE_EXPECT("RETURN 1", NULL);
@@ -1659,6 +1688,97 @@ TEST(neo4j_live_engine_reads_match_local) {
     PASS();
 }
 
+/* Native and store connections run in Neo4j's READ access mode with a
+ * server-side time limit: the server itself refuses a write the keyword
+ * guard did not see, and stops a runaway query. */
+TEST(neo4j_live_read_only_connection_refuses_writes) {
+    const char *uri = getenv("CBM_TEST_NEO4J_URI");
+    const char *pw = getenv("CBM_TEST_NEO4J_PASSWORD");
+    ASSERT_TRUE(uri && uri[0]);
+    clear_neo4j_env();
+    cbm_neo4j_config_t cfg;
+    char err[512];
+    ASSERT_EQ(cbm_neo4j_config_resolve(uri, NULL, pw, NULL, &cfg, err, sizeof(err)), 0);
+    cbm_neo4j_t *c = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(c);
+    ASSERT_EQ(cbm_neo4j_set_read_only(c, 1500), 0);
+    cbm_neo4j_batch_t b;
+    cbm_neo4j_result_t r;
+    ASSERT_EQ(cbm_neo4j_batch_init(&b), 0);
+    (void)cbm_neo4j_batch_add(&b, "CREATE (:CbmReadOnlyProbe) RETURN 1");
+    ASSERT_EQ(cbm_neo4j_batch_run(c, &b, &r), -1);
+    cbm_neo4j_batch_free(&b);
+    ASSERT_NOT_NULL(strstr(cbm_neo4j_error(c), "AccessMode"));
+    uint64_t t0 = cbm_now_ms();
+    ASSERT_EQ(cbm_neo4j_batch_init(&b), 0);
+    (void)cbm_neo4j_batch_add(&b, "UNWIND range(1, 2000000000) AS x RETURN count(x)");
+    ASSERT_EQ(cbm_neo4j_batch_run(c, &b, &r), -1);
+    cbm_neo4j_batch_free(&b);
+    uint64_t took = cbm_now_ms() - t0;
+    printf("  [ro] runaway query stopped by the server after %llu ms: %.80s\n",
+           (unsigned long long)took, cbm_neo4j_error(c));
+    ASSERT_LT(took, 30000);
+    cbm_neo4j_close(c);
+
+    /* the write really did not happen */
+    c = cbm_neo4j_connect(&cfg, err, sizeof(err));
+    ASSERT_NOT_NULL(c);
+    ASSERT_EQ(cbm_neo4j_batch_init(&b), 0);
+    (void)cbm_neo4j_batch_add(&b, "MATCH (p:CbmReadOnlyProbe) RETURN count(p)");
+    ASSERT_EQ(cbm_neo4j_batch_run(c, &b, &r), 0);
+    cbm_neo4j_batch_free(&b);
+    ASSERT_EQ(cbm_neo4j_val_int(cbm_neo4j_row_col(yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0)), 0), -1), 0);
+    cbm_neo4j_result_free(&r);
+    cbm_neo4j_close(c);
+    cbm_neo4j_config_wipe(&cfg);
+    PASS();
+}
+
+/* A server that accepts connections but never answers (hung, or a network
+ * black hole in front of it) fails a request after one silent stall tick
+ * plus the liveness check, not after the 120 s I/O timeout -- and the error
+ * says the server stopped responding. */
+TEST(neo4j_http_dead_server_fails_fast) {
+#ifdef _WIN32
+    SKIP_PLATFORM("uses a POSIX loopback listener");
+#else
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_TRUE(ls >= 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    ASSERT_EQ(bind(ls, (struct sockaddr *)&a, sizeof(a)), 0);
+    ASSERT_EQ(listen(ls, 16), 0); /* the kernel completes connects; nothing ever answers */
+    socklen_t al = sizeof(a);
+    ASSERT_EQ(getsockname(ls, (struct sockaddr *)&a, &al), 0);
+    char url[64];
+    (void)snprintf(url, sizeof(url), "http://127.0.0.1:%d", (int)ntohs(a.sin_port));
+    cbm_neo4j_url_t u;
+    char err[512] = "";
+    ASSERT_EQ(cbm_neo4j_url_parse(url, &u, err, sizeof(err)), 0);
+    cbm_neo4j_http_t *h = cbm_neo4j_http_open(&u, "neo4j", "x", err, sizeof(err));
+    ASSERT_NOT_NULL(h);
+    int status = 0;
+    char *resp = NULL;
+    uint64_t t0 = cbm_now_ms();
+    int rc = cbm_neo4j_http_post(h, "/db/neo4j/tx/commit", "{}", 2, &status, &resp, NULL, err,
+                                 sizeof(err));
+    uint64_t took = cbm_now_ms() - t0;
+    printf("  [stall] dead server reported after %llu ms: %.120s\n", (unsigned long long)took,
+           err);
+    free(resp);
+    cbm_neo4j_http_close(h);
+    close(ls);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NOT_NULL(strstr(err, "stopped responding"));
+    ASSERT_TRUE(took >= 9000); /* one silent tick first: a slow reply is not a dead server */
+    ASSERT_LT(took, 25000);    /* not the 120 s I/O timeout, and no second try */
+    PASS();
+#endif
+}
+
 SUITE(neo4j) {
     RUN_TEST(neo4j_url_defaults);
     RUN_TEST(neo4j_url_port_path_ipv6);
@@ -1683,11 +1803,13 @@ SUITE(neo4j) {
     RUN_TEST(neo4j_marker_found_for_renamed_database);
     RUN_TEST(neo4j_served_by_is_named_in_replies);
     RUN_TEST(neo4j_scope_query_scopes_every_node_pattern);
+    RUN_TEST(neo4j_http_dead_server_fails_fast);
     if (live_neo4j_configured()) {
         RUN_TEST(neo4j_live_sync_and_read);
         RUN_TEST(neo4j_live_list_files_matches_local);
         RUN_TEST(neo4j_live_large_file_list_matches_local);
         RUN_TEST(neo4j_live_engine_reads_match_local);
+        RUN_TEST(neo4j_live_read_only_connection_refuses_writes);
     } else {
         printf("  (neo4j live test not registered: set CBM_TEST_NEO4J_URI and "
                "CBM_TEST_NEO4J_PASSWORD to run it against a server)\n");

@@ -421,6 +421,7 @@ typedef enum {
     CBM_REMOTE_COUNT_NODES = 0,
     CBM_REMOTE_COUNT_EDGES,
     CBM_REMOTE_COUNT_EDGES_BY_TYPE, /* arg = type */
+    CBM_REMOTE_COUNT_NODES_BY_LABEL, /* arg = label */
 } cbm_remote_count_t;
 
 typedef struct cbm_store_remote_ops {
@@ -509,6 +510,9 @@ bool cbm_store_is_remote(const cbm_store_t *s);
  * marks itself local with cbm_store_note_local_graph_read; remote queries
  * are counted by the backend. Both are no-ops / zero without a remote. */
 void cbm_store_note_local_graph_read(cbm_store_t *s, const char *what);
+/* n queries answered by this store's remote backend on another connection
+ * (query_graph's native answer), counted with the backend's own. */
+void cbm_store_note_remote_queries(cbm_store_t *s, uint64_t n);
 typedef struct {
     uint64_t remote_queries;
     int local_reads;
@@ -811,6 +815,9 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
 
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */
 int cbm_store_count_nodes(cbm_store_t *s, const char *project);
+
+/* Count the project's nodes carrying label. Returns count or CBM_STORE_ERR. */
+int cbm_store_count_nodes_by_label(cbm_store_t *s, const char *project, const char *label);
 
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
 

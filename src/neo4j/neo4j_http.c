@@ -23,6 +23,8 @@ typedef SOCKET cbm_n4_sock_t;
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -40,13 +42,27 @@ typedef int cbm_n4_sock_t;
 #define N4_DEFAULT_HTTP_PORT 7474
 #define N4_DEFAULT_HTTPS_PORT 7473
 #define N4_IO_TIMEOUT_MS 120000
+/* Silence on a request before checking that the server is still there, and
+ * that check's own limit: a server that is down, hung or unreachable fails a
+ * request in about N4_STALL_TICK_MS + N4_PROBE_MS instead of the full wait,
+ * while a live server running a long query keeps being waited for. */
+#define N4_STALL_TICK_MS 10000
+#define N4_PROBE_MS 5000
+/* Establishing a connection: a host that drops packets would otherwise hold
+ * a blocking connect() for the OS's SYN retries (a minute or more). */
+#define N4_CONNECT_MS 10000
+
+enum { N4_STALL_NONE = 0, N4_STALL_DEAD, N4_STALL_LIMIT };
 #define N4_HDR_MAX (64U * 1024U)
 #define N4_RESP_MAX ((size_t)1 << 30) /* 1 GiB: refuse anything larger */
 
 struct cbm_neo4j_http {
     cbm_neo4j_url_t url;
     char *auth_header; /* "Basic xxx" or NULL */
+    char *extra_headers; /* "Name: value\r\n..." added to every request, or NULL */
     cbm_n4_sock_t sock;
+    int max_wait_ms; /* longest silence on a live server; 0 = N4_IO_TIMEOUT_MS */
+    int stall;       /* N4_STALL_*: why the last exchange stopped waiting */
     /* Bytes read past the end of the previous response (keep-alive). */
     char *carry;
     size_t carry_len;
@@ -211,6 +227,135 @@ static void n4_set_timeouts(cbm_n4_sock_t s) {
     (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 }
 
+static bool n4_set_nonblocking(cbm_n4_sock_t s, bool on) {
+#ifdef _WIN32
+    u_long mode = on ? 1 : 0;
+    return ioctlsocket(s, FIONBIO, &mode) == 0;
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    if (fl < 0) {
+        return false;
+    }
+    return fcntl(s, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK)) == 0;
+#endif
+}
+
+/* Wait until s can be read (want_write: written). 1 ready, 0 after ms with
+ * nothing, -1 on error. poll() on POSIX: select()'s fd_set cannot hold a
+ * descriptor above FD_SETSIZE in a process with many files open. */
+static int n4_wait(cbm_n4_sock_t s, bool want_write, int ms) {
+#ifdef _WIN32
+    fd_set set;
+    fd_set errs;
+    FD_ZERO(&set);
+    FD_SET(s, &set);
+    FD_ZERO(&errs);
+    FD_SET(s, &errs);
+    struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
+    int rc = select(0, want_write ? NULL : &set, want_write ? &set : NULL, &errs, &tv);
+    return rc > 0 ? 1 : (rc == 0 ? 0 : -1);
+#else
+    struct pollfd p = {.fd = s, .events = want_write ? POLLOUT : POLLIN};
+    int rc;
+    do {
+        rc = poll(&p, 1, ms);
+    } while (rc < 0 && errno == EINTR);
+    return rc > 0 ? 1 : (rc == 0 ? 0 : -1);
+#endif
+}
+
+/* connect() that gives up after ms. */
+static bool n4_connect_within(cbm_n4_sock_t s, const struct sockaddr *addr, int addr_len, int ms) {
+    if (!n4_set_nonblocking(s, true)) {
+        return connect(s, addr, addr_len) == 0;
+    }
+    bool ok = connect(s, addr, addr_len) == 0;
+    if (!ok) {
+#ifdef _WIN32
+        bool pending = WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+        bool pending = errno == EINPROGRESS;
+#endif
+        if (pending && n4_wait(s, true, ms) > 0) {
+            int soerr = 0;
+            socklen_t len = sizeof(soerr);
+            ok = getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&soerr, &len) == 0 && soerr == 0;
+        }
+    }
+    return n4_set_nonblocking(s, false) && ok;
+}
+
+/* A connected socket to host:port within connect_ms, or N4_SOCK_BAD. */
+static cbm_n4_sock_t n4_open_socket(const char *host, int port, int connect_ms) {
+    n4_net_init();
+    char port_s[16];
+    (void)snprintf(port_s, sizeof(port_s), "%d", port);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, port_s, &hints, &res) != 0 || !res) {
+        return N4_SOCK_BAD;
+    }
+    cbm_n4_sock_t s = N4_SOCK_BAD;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == N4_SOCK_BAD) {
+            continue;
+        }
+        if (n4_connect_within(s, ai->ai_addr, (int)ai->ai_addrlen, connect_ms)) {
+            break;
+        }
+        n4_sock_close(s);
+        s = N4_SOCK_BAD;
+    }
+    freeaddrinfo(res);
+    return s;
+}
+
+/* Is the server still answering? A fresh connection, one GET, any HTTP
+ * status line back within N4_PROBE_MS. Lets a stalled request tell a slow
+ * query on a live server from a server that is gone. */
+static bool n4_probe(const cbm_neo4j_http_t *h) {
+    cbm_n4_sock_t s = n4_open_socket(h->url.host, h->url.port, N4_PROBE_MS);
+    if (s == N4_SOCK_BAD) {
+        return false;
+    }
+    char req[CBM_NEO4J_HOST_MAX + 96];
+    int n = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
+                     h->url.host, h->url.port);
+    bool alive = false;
+    if (n > 0 && (size_t)n < sizeof(req) && send(s, req, n, N4_SEND_FLAGS) == n &&
+        n4_wait(s, false, N4_PROBE_MS) > 0) {
+        char buf[8] = {0};
+        alive = recv(s, buf, 5, 0) == 5 && memcmp(buf, "HTTP/", 5) == 0;
+    }
+    n4_sock_close(s);
+    return alive;
+}
+
+/* The error for a failed read: names a dead server or the wait limit when
+ * that is why the read stopped. */
+static void n4_io_err(const cbm_neo4j_http_t *h, char *err, size_t err_sz, const char *plain) {
+    char buf[256];
+    if (h->stall == N4_STALL_DEAD) {
+        (void)snprintf(buf, sizeof(buf),
+                       "Neo4j stopped responding: no reply for %d s, and a new connection to "
+                       "%s:%d got no answer either (server down, hung or unreachable)",
+                       N4_STALL_TICK_MS / 1000, h->url.host, h->url.port);
+        n4_err(err, err_sz, "%s", buf);
+    } else if (h->stall == N4_STALL_LIMIT) {
+        (void)snprintf(buf, sizeof(buf),
+                       "no reply from Neo4j within %d s (the server is up, but did not answer "
+                       "this request)",
+                       (h->max_wait_ms > 0 ? h->max_wait_ms : N4_IO_TIMEOUT_MS) / 1000);
+        n4_err(err, err_sz, "%s", buf);
+    } else {
+        n4_err(err, err_sz, plain, NULL);
+    }
+}
+
 static void n4_disconnect(cbm_neo4j_http_t *h) {
     if (h->sock != N4_SOCK_BAD) {
         n4_sock_close(h->sock);
@@ -234,19 +379,8 @@ static int n4_connect(cbm_neo4j_http_t *h, char *err, size_t err_sz) {
         n4_err(err, err_sz, "cannot resolve Neo4j host '%s'", h->url.host);
         return -1;
     }
-    cbm_n4_sock_t s = N4_SOCK_BAD;
-    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s == N4_SOCK_BAD) {
-            continue;
-        }
-        if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) {
-            break;
-        }
-        n4_sock_close(s);
-        s = N4_SOCK_BAD;
-    }
     freeaddrinfo(res);
+    cbm_n4_sock_t s = n4_open_socket(h->url.host, h->url.port, N4_CONNECT_MS);
     if (s == N4_SOCK_BAD) {
         char buf[CBM_NEO4J_HOST_MAX + 32];
         (void)snprintf(buf, sizeof(buf), "%s:%d", h->url.host, h->url.port);
@@ -297,10 +431,34 @@ static int n4_buf_reserve(n4_buf_t *b, size_t extra) {
     return 0;
 }
 
-/* Read more bytes from the socket into b. Returns bytes read, 0 on EOF, -1 on error. */
+/* Read more bytes from the socket into b. Returns bytes read, 0 on EOF, -1 on
+ * error. Silence is checked every N4_STALL_TICK_MS: a server that no longer
+ * answers a fresh connection fails the read at once (stall DEAD); a live one
+ * is waited for up to max_wait_ms in all (stall LIMIT). */
 static int n4_recv_more(cbm_neo4j_http_t *h, n4_buf_t *b) {
     if (n4_buf_reserve(b, 16384) != 0) {
         return -1;
+    }
+    int limit = h->max_wait_ms > 0 ? h->max_wait_ms : N4_IO_TIMEOUT_MS;
+    int waited = 0;
+    for (;;) {
+        int tick = limit - waited < N4_STALL_TICK_MS ? limit - waited : N4_STALL_TICK_MS;
+        int ready = n4_wait(h->sock, false, tick);
+        if (ready > 0) {
+            break;
+        }
+        if (ready < 0) {
+            return -1;
+        }
+        waited += tick;
+        if (waited >= limit) {
+            h->stall = N4_STALL_LIMIT;
+            return -1;
+        }
+        if (!n4_probe(h)) {
+            h->stall = N4_STALL_DEAD;
+            return -1;
+        }
     }
     int n = (int)recv(h->sock, b->data + b->len, 16384, 0);
     if (n > 0) {
@@ -498,6 +656,7 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
                               const char *body, size_t body_len, int *status, char **resp,
                               size_t *resp_len, bool *retryable, char *err, size_t err_sz) {
     *retryable = false;
+    h->stall = N4_STALL_NONE;
     bool reused = h->sock != N4_SOCK_BAD;
     if (!reused && n4_connect(h, err, err_sz) != 0) {
         return -1;
@@ -533,10 +692,12 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
         }
         int n = n4_recv_more(h, &b);
         if (n <= 0) {
-            *retryable = reused && b.len == 0;
+            /* Only a keep-alive connection the server had already closed is
+             * worth a second try; a request that went unanswered is not. */
+            *retryable = reused && b.len == 0 && h->stall == N4_STALL_NONE;
             free(b.data);
             n4_disconnect(h);
-            n4_err(err, err_sz, "no response from Neo4j (connection closed or timed out)%s", NULL);
+            n4_io_err(h, err, err_sz, "no response from Neo4j (connection closed or timed out)%s");
             return -1;
         }
     }
@@ -568,10 +729,9 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
         if (rc != 0) {
             free(b.data);
             n4_disconnect(h);
-            n4_err(err, err_sz,
-                   rc > 0 ? "truncated response from Neo4j%s"
-                          : "malformed chunked response from Neo4j%s",
-                   NULL);
+            n4_io_err(h, err, err_sz,
+                      rc > 0 ? "truncated response from Neo4j%s"
+                             : "malformed chunked response from Neo4j%s");
             return -1;
         }
     } else if (content_len >= 0) {
@@ -585,7 +745,7 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
             if (n4_recv_more(h, &b) <= 0) {
                 free(b.data);
                 n4_disconnect(h);
-                n4_err(err, err_sz, "truncated response from Neo4j%s", NULL);
+                n4_io_err(h, err, err_sz, "truncated response from Neo4j%s");
                 return -1;
             }
         }
@@ -594,6 +754,12 @@ static int n4_socket_exchange(cbm_neo4j_http_t *h, const char *req, size_t req_l
     } else {
         /* Body delimited by connection close. */
         while (n4_recv_more(h, &b) > 0) {}
+        if (h->stall != N4_STALL_NONE) {
+            free(b.data);
+            n4_disconnect(h);
+            n4_io_err(h, err, err_sz, "truncated response from Neo4j%s");
+            return -1;
+        }
         out_len = b.len - body_off;
         consumed = b.len;
         conn_close = true;
@@ -655,7 +821,7 @@ static int n4_winhttp_post(cbm_neo4j_http_t *h, const char *full_path, const cha
             n4_err(err, err_sz, "WinHttpOpen failed%s", NULL);
             return -1;
         }
-        (void)WinHttpSetTimeouts(h->session, N4_IO_TIMEOUT_MS, N4_IO_TIMEOUT_MS, N4_IO_TIMEOUT_MS,
+        (void)WinHttpSetTimeouts(h->session, N4_CONNECT_MS, N4_CONNECT_MS, N4_IO_TIMEOUT_MS,
                                  N4_IO_TIMEOUT_MS);
         wchar_t *whost = n4_widen(h->url.host);
         if (!whost) {
@@ -679,11 +845,15 @@ static int n4_winhttp_post(cbm_neo4j_http_t *h, const char *full_path, const cha
         n4_err(err, err_sz, "WinHttpOpenRequest failed%s", NULL);
         return -1;
     }
+    DWORD recv_ms = (DWORD)(h->max_wait_ms > 0 ? h->max_wait_ms : N4_IO_TIMEOUT_MS);
+    (void)WinHttpSetOption(req, WINHTTP_OPTION_RECEIVE_TIMEOUT, &recv_ms, sizeof(recv_ms));
+    (void)WinHttpSetOption(req, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &recv_ms,
+                           sizeof(recv_ms));
     char hdrs[1024];
     (void)snprintf(hdrs, sizeof(hdrs),
-                   "Content-Type: application/json\r\nAccept: application/json\r\n%s%s%s",
+                   "Content-Type: application/json\r\nAccept: application/json\r\n%s%s%s%s",
                    h->auth_header ? "Authorization: " : "", h->auth_header ? h->auth_header : "",
-                   h->auth_header ? "\r\n" : "");
+                   h->auth_header ? "\r\n" : "", h->extra_headers ? h->extra_headers : "");
     wchar_t *whdrs = n4_widen(hdrs);
     BOOL ok = whdrs && WinHttpSendRequest(req, whdrs, (DWORD)-1L, (LPVOID)body, (DWORD)body_len,
                                           (DWORD)body_len, 0);
@@ -802,7 +972,8 @@ int cbm_neo4j_http_post(cbm_neo4j_http_t *h, const char *path, const char *body,
     }
 #endif
     size_t req_cap = strlen(full_path) + strlen(h->url.host) +
-                     (h->auth_header ? strlen(h->auth_header) : 0) + 256;
+                     (h->auth_header ? strlen(h->auth_header) : 0) +
+                     (h->extra_headers ? strlen(h->extra_headers) : 0) + 256;
     char *req = malloc(req_cap);
     if (!req) {
         return -1;
@@ -814,11 +985,12 @@ int cbm_neo4j_http_post(cbm_neo4j_http_t *h, const char *path, const char *body,
                            "Accept: application/json;charset=UTF-8\r\n"
                            "Content-Length: %zu\r\n"
                            "Connection: keep-alive\r\n"
-                           "%s%s%s"
+                           "%s%s%s%s"
                            "\r\n",
                            full_path, h->url.host, h->url.port, body_len,
                            h->auth_header ? "Authorization: " : "",
-                           h->auth_header ? h->auth_header : "", h->auth_header ? "\r\n" : "");
+                           h->auth_header ? h->auth_header : "", h->auth_header ? "\r\n" : "",
+                           h->extra_headers ? h->extra_headers : "");
     if (req_len < 0 || (size_t)req_len >= req_cap) {
         free(req);
         return -1;
@@ -836,10 +1008,35 @@ int cbm_neo4j_http_post(cbm_neo4j_http_t *h, const char *path, const char *body,
     return rc;
 }
 
+void cbm_neo4j_http_set_max_wait(cbm_neo4j_http_t *h, int max_wait_ms) {
+    if (h) {
+        h->max_wait_ms = max_wait_ms > 0 ? max_wait_ms : 0;
+    }
+}
+
+int cbm_neo4j_http_set_extra_headers(cbm_neo4j_http_t *h, const char *headers) {
+    if (!h) {
+        return -1;
+    }
+    char *copy = NULL;
+    if (headers && headers[0]) {
+        size_t n = strlen(headers);
+        copy = malloc(n + 1);
+        if (!copy) {
+            return -1;
+        }
+        memcpy(copy, headers, n + 1);
+    }
+    free(h->extra_headers);
+    h->extra_headers = copy;
+    return 0;
+}
+
 void cbm_neo4j_http_close(cbm_neo4j_http_t *h) {
     if (!h) {
         return;
     }
+    free(h->extra_headers);
     n4_disconnect(h);
 #ifdef _WIN32
     if (h->connect) {
