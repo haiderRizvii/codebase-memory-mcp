@@ -10,6 +10,8 @@
 #include "neo4j/neo4j_sync.h"
 
 #include "foundation/log.h"
+#include "foundation/limits.h"
+#include "foundation/platform.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -74,6 +76,9 @@ typedef struct {
     n4s_edge_cache_t edge_cache[2]; /* [0] by source, [1] by target */
     n4s_node_cache_t chunk_nodes[2]; /* far ends of the last prefetch, per direction */
     n4s_node_cache_t last_nodes;    /* far ends of the last single-node edge read */
+    /* Wall-clock ms after which a multi-page read gives up between pages
+     * (CBM_STORE_SCAN_LIMIT); 0 = none. Set by the Cypher engine. */
+    uint64_t read_deadline_ms;
 } n4s_ctx_t;
 
 /* ── Query plumbing ─────────────────────────────────────────────── */
@@ -367,12 +372,6 @@ static void node_cache_free(n4s_node_cache_t *c) {
     c->count = 0;
 }
 
-static int cmp_node_id(const void *a, const void *b) {
-    int64_t x = ((const cbm_node_t *)a)->id;
-    int64_t y = ((const cbm_node_t *)b)->id;
-    return (x > y) - (x < y);
-}
-
 /* Take ownership of nodes[0..n): sort by id and drop duplicates. */
 static void node_cache_set(n4s_node_cache_t *c, cbm_node_t *nodes, int n) {
     node_cache_free(c);
@@ -380,7 +379,7 @@ static void node_cache_set(n4s_node_cache_t *c, cbm_node_t *nodes, int n) {
         free(nodes);
         return;
     }
-    qsort(nodes, (size_t)n, sizeof(cbm_node_t), cmp_node_id);
+    qsort(nodes, (size_t)n, sizeof(cbm_node_t), cbm_store_node_cmp_id);
     int w = 0;
     for (int i = 0; i < n; i++) {
         if (w > 0 && nodes[w - 1].id == nodes[i].id) {
@@ -397,21 +396,10 @@ static void node_cache_set(n4s_node_cache_t *c, cbm_node_t *nodes, int n) {
 }
 
 static const cbm_node_t *node_cache_find(const n4s_node_cache_t *c, int64_t id) {
-    int lo = 0;
-    int hi = c->count - 1;
-    while (lo <= hi) {
-        int mid = lo + (hi - lo) / 2;
-        int64_t v = c->nodes[mid].id;
-        if (v == id) {
-            return &c->nodes[mid];
-        }
-        if (v < id) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    return NULL;
+    cbm_node_t key = {.id = id};
+    return c->count > 0 ? bsearch(&key, c->nodes, (size_t)c->count, sizeof(cbm_node_t),
+                                  cbm_store_node_cmp_id)
+                        : NULL;
 }
 
 static void edge_cache_free(n4s_edge_cache_t *c) {
@@ -460,20 +448,7 @@ static int cmp_edge_by_target(const void *a, const void *b) {
 }
 
 static bool ids_contain(const int64_t *ids, int n, int64_t id) {
-    int lo = 0;
-    int hi = n - 1;
-    while (lo <= hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (ids[mid] == id) {
-            return true;
-        }
-        if (ids[mid] < id) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    return false;
+    return n > 0 && bsearch(&id, ids, (size_t)n, sizeof(int64_t), cmp_i64_asc) != NULL;
 }
 
 static bool cache_has_type(const n4s_edge_cache_t *c, const char *type) {
@@ -555,27 +530,24 @@ static int edge_cache_lookup(n4s_ctx_t *x, int64_t node_id, bool by_target, cons
 
 /* Edge rows: r.id, project, source, target, type, properties_json, then (when
  * far_ends) the N4S_NODE_COLS of the node at the other end of the edge. */
-static int collect_edges_ex(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count,
-                            cbm_node_t **far, int *far_count) {
+static int edges_from_data(yyjson_val *data, cbm_edge_t **out, int *count, cbm_node_t **far,
+                           int *far_count) {
     *out = NULL;
     *count = 0;
     if (far) {
         *far = NULL;
         *far_count = 0;
     }
-    cbm_neo4j_result_t r;
-    if (q_run(x, q, &r) != CBM_STORE_OK) {
+    size_t n = yyjson_arr_size(data);
+    if (n > INT_MAX) {
         return CBM_STORE_ERR;
     }
-    yyjson_val *data = cbm_neo4j_result_data(&r, 0);
-    size_t n = yyjson_arr_size(data);
     if (n > 0) {
         cbm_edge_t *arr = calloc(n, sizeof(cbm_edge_t));
         cbm_node_t *nodes = far ? calloc(n, sizeof(cbm_node_t)) : NULL;
         if (!arr || (far && !nodes)) {
             free(arr);
             free(nodes);
-            cbm_neo4j_result_free(&r);
             return CBM_STORE_ERR;
         }
         yyjson_arr_iter it = yyjson_arr_iter_with(data);
@@ -598,8 +570,24 @@ static int collect_edges_ex(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *cou
             *far_count = (int)n;
         }
     }
-    cbm_neo4j_result_free(&r);
     return CBM_STORE_OK;
+}
+
+static int collect_edges_ex(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count,
+                            cbm_node_t **far, int *far_count) {
+    *out = NULL;
+    *count = 0;
+    if (far) {
+        *far = NULL;
+        *far_count = 0;
+    }
+    cbm_neo4j_result_t r;
+    if (q_run(x, q, &r) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    int rc = edges_from_data(cbm_neo4j_result_data(&r, 0), out, count, far, far_count);
+    cbm_neo4j_result_free(&r);
+    return rc;
 }
 
 static int collect_edges(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count) {
@@ -609,6 +597,68 @@ static int collect_edges(n4s_ctx_t *x, n4s_q_t *q, cbm_edge_t **out, int *count)
 #define N4S_EDGE_RET \
     " RETURN r.id, a.project, a.id, b.id, coalesce(r.type, type(r)), r.properties_json"
 
+/* Edges one prefetch request may pull: more would be one large,
+ * uninterruptible HTTP response. */
+#define N4S_PREFETCH_EDGE_CAP 50000
+/* A node with more edges than this (in the prefetched direction, any type)
+ * is a hub: it is left out of a prefetch and read on its own, in pages. */
+#define N4S_HUB_DEGREE 5000
+/* Rows per page of one node's edges. */
+#define N4S_EDGE_PAGE 50000
+
+/* Tests shrink these to exercise hubs and paging on a small graph. */
+static _Thread_local int g_n4s_prefetch_cap = N4S_PREFETCH_EDGE_CAP;
+static _Thread_local int g_n4s_hub_degree = N4S_HUB_DEGREE;
+static _Thread_local int g_n4s_edge_page = N4S_EDGE_PAGE;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_neo4j_test_set_edge_limits(int prefetch_cap, int hub_degree, int edge_page) {
+    g_n4s_prefetch_cap = prefetch_cap > 0 ? prefetch_cap : N4S_PREFETCH_EDGE_CAP;
+    g_n4s_hub_degree = hub_degree > 0 ? hub_degree : N4S_HUB_DEGREE;
+    g_n4s_edge_page = edge_page > 0 ? edge_page : N4S_EDGE_PAGE;
+}
+#endif
+
+static bool read_deadline_passed(const n4s_ctx_t *x) {
+    return x->read_deadline_ms != 0 && cbm_now_ms() >= x->read_deadline_ms;
+}
+
+/* Append src[0..n) to the growing (edges, far) pair arrays, taking ownership. */
+static int edges_append(cbm_edge_t **edges, cbm_node_t **far, int *count, int *cap,
+                        cbm_edge_t *src_e, cbm_node_t *src_n, int n) {
+    if (n <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (*count > INT_MAX - n) {
+        return CBM_STORE_ERR;
+    }
+    if (*count + n > *cap) {
+        int next = *cap > 0 ? *cap : 1024;
+        while (next < *count + n) {
+            next = next > INT_MAX / 2 ? INT_MAX : next * 2;
+        }
+        cbm_edge_t *ge = realloc(*edges, (size_t)next * sizeof(cbm_edge_t));
+        if (!ge) {
+            return CBM_STORE_ERR;
+        }
+        *edges = ge;
+        cbm_node_t *gn = realloc(*far, (size_t)next * sizeof(cbm_node_t));
+        if (!gn) {
+            return CBM_STORE_ERR;
+        }
+        *far = gn;
+        *cap = next;
+    }
+    memcpy(*edges + *count, src_e, (size_t)n * sizeof(cbm_edge_t));
+    memcpy(*far + *count, src_n, (size_t)n * sizeof(cbm_node_t));
+    *count += n;
+    return CBM_STORE_OK;
+}
+
+/* One node's edges in r.id order, g_n4s_edge_page rows per round trip (a
+ * hub's 200k callers were one 6 s response). A normal node is one page. The
+ * read deadline is checked between pages: past it the rows read are dropped
+ * and CBM_STORE_SCAN_LIMIT returned, so the caller's budget holds. */
 static int op_find_edges(void *ctx, int64_t node_id, bool by_target, const char *type,
                          cbm_edge_t **out, int *count) {
     n4s_ctx_t *x = ctx;
@@ -616,41 +666,139 @@ static int op_find_edges(void *ctx, int64_t node_id, bool by_target, const char 
     if (cached != CBM_STORE_NOT_FOUND) {
         return cached;
     }
+    *out = NULL;
+    *count = 0;
     /* The far ends come back too: a caller walking these edges looks every
      * one of them up next (find_node_by_id answers from last_nodes). */
     const char *cypher =
         by_target
             ? "MATCH (a:CbmNode)-[r]->(b:CbmNode {db: $db, gen: $gen, id: $id}) "
-              "WHERE a.db = $db AND a.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
-              ", " N4S_FAR_COLS("a") " ORDER BY r.id"
+              "WHERE a.db = $db AND a.gen = $gen AND ($type IS NULL OR r.type = $type) "
+              "AND ($after IS NULL OR r.id > $after)" N4S_EDGE_RET ", " N4S_FAR_COLS(
+                  "a") " ORDER BY r.id LIMIT $lim"
             : "MATCH (a:CbmNode {db: $db, gen: $gen, id: $id})-[r]->(b:CbmNode) "
-              "WHERE b.db = $db AND b.gen = $gen AND ($type IS NULL OR r.type = $type)" N4S_EDGE_RET
-              ", " N4S_FAR_COLS("b") " ORDER BY r.id";
-    n4s_q_t q;
-    if (q_begin(x, &q, cypher) != 0) {
-        return CBM_STORE_ERR;
+              "WHERE b.db = $db AND b.gen = $gen AND ($type IS NULL OR r.type = $type) "
+              "AND ($after IS NULL OR r.id > $after)" N4S_EDGE_RET ", " N4S_FAR_COLS(
+                  "b") " ORDER BY r.id LIMIT $lim";
+    const int page = g_n4s_edge_page;
+    cbm_edge_t *all_e = NULL;
+    cbm_node_t *all_n = NULL;
+    int all = 0;
+    int cap = 0;
+    bool first = true;
+    int64_t after = 0;
+    int rc = CBM_STORE_OK;
+    for (;;) {
+        n4s_q_t q;
+        if (q_begin(x, &q, cypher) != 0) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        q_int(&q, "id", node_id);
+        q_str(&q, "type", type);
+        if (first) {
+            yyjson_mut_obj_add_null(q.b.doc, q.params, "after");
+        } else {
+            q_int(&q, "after", after);
+        }
+        q_int(&q, "lim", (int64_t)page + 1); /* one probe row: is there another page? */
+        cbm_edge_t *pe = NULL;
+        cbm_node_t *pn = NULL;
+        int pc = 0;
+        int pf = 0;
+        rc = collect_edges_ex(x, &q, &pe, &pc, &pn, &pf);
+        if (rc != CBM_STORE_OK) {
+            break;
+        }
+        bool more = pc > page;
+        int take = more ? page : pc;
+        if (more) {
+            after = pe[page - 1].id;
+            for (int i = page; i < pc; i++) { /* the probe row is read again next page */
+                edge_fields_free(&pe[i]);
+                node_free(&pn[i]);
+            }
+        }
+        rc = edges_append(&all_e, &all_n, &all, &cap, pe, pn, take);
+        if (rc != CBM_STORE_OK) {
+            for (int i = 0; i < take; i++) {
+                edge_fields_free(&pe[i]);
+                node_free(&pn[i]);
+            }
+        }
+        free(pe);
+        free(pn);
+        if (rc != CBM_STORE_OK || !more) {
+            break;
+        }
+        first = false;
+        if (read_deadline_passed(x)) {
+            rc = CBM_STORE_SCAN_LIMIT;
+            break;
+        }
     }
-    q_int(&q, "id", node_id);
-    q_str(&q, "type", type);
-    cbm_node_t *far = NULL;
-    int far_count = 0;
-    int rc = collect_edges_ex(x, &q, out, count, &far, &far_count);
-    if (rc == CBM_STORE_OK) {
-        node_cache_set(&x->last_nodes, far, far_count);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_free_edges(all_e, all);
+        cbm_store_free_nodes(all_n, all);
+        if (rc == CBM_STORE_SCAN_LIMIT) {
+            (void)snprintf(x->err, sizeof(x->err), "%s",
+                           "edge read stopped at the query's time limit");
+        }
+        return rc;
     }
-    return rc;
+    node_cache_set(&x->last_nodes, all_n, all);
+    *out = all_e;
+    *count = all;
+    return CBM_STORE_OK;
 }
 
-/* Edges one prefetch may pull. Past it the walk would download a large
- * share of the graph over HTTP, one uninterruptible response: the caller is
- * told (CBM_STORE_SCAN_LIMIT) so it can answer another way. */
-#define N4S_PREFETCH_EDGE_CAP 50000
+#define N4S_PREFETCH_EDGES_TARGET                                                            \
+    "MATCH (b:CbmNode {db: $db, gen: $gen}) WHERE b.id IN $ids AND COUNT { (b)<--() } <= $hub " \
+    "MATCH (a:CbmNode)-[r]->(b) "                                                             \
+    "WHERE a.db = $db AND a.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET  \
+    ", " N4S_FAR_COLS("a") " LIMIT $cap"
+#define N4S_PREFETCH_EDGES_SOURCE                                                            \
+    "MATCH (a:CbmNode {db: $db, gen: $gen}) WHERE a.id IN $ids AND COUNT { (a)-->() } <= $hub " \
+    "MATCH (a)-[r]->(b:CbmNode) "                                                             \
+    "WHERE b.db = $db AND b.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET  \
+    ", " N4S_FAR_COLS("b") " LIMIT $cap"
+
+/* Parameters of one prefetch edge statement. */
+static void prefetch_edge_params(n4s_q_t *q, const int64_t *ids, int n, const char *const *types,
+                                 int type_count) {
+    q_ids(q, "ids", ids, n);
+    q_int(q, "cap", (int64_t)g_n4s_prefetch_cap + 1);
+    q_int(q, "hub", g_n4s_hub_degree);
+    if (types && type_count > 0) {
+        q_types(q, "types", (const char **)types, type_count);
+    } else {
+        yyjson_mut_obj_add_null(q->b.doc, q->params, "types");
+    }
+}
+
+typedef struct {
+    int64_t id;
+    int64_t degree;
+} n4s_degree_t;
+
+static int cmp_degree_by_id(const void *a, const void *b) {
+    int64_t x = ((const n4s_degree_t *)a)->id;
+    int64_t y = ((const n4s_degree_t *)b)->id;
+    return (x > y) - (x < y);
+}
 
 /* Fetch every edge of ids[0..n) in one direction (types NULL: all types)
  * plus their far-end nodes, replacing that direction's edge cache and the
- * chunk node cache. A failure leaves the caches empty: reads then go to
- * Neo4j one by one, so prefetching can only make a walk faster. More than
- * N4S_PREFETCH_EDGE_CAP edges: CBM_STORE_SCAN_LIMIT, caches empty. */
+ * chunk node cache. A hint only: a failure leaves the caches empty and reads
+ * then go to Neo4j one by one, so it never changes an answer.
+ *
+ * One request carries two statements: every node's degree (Neo4j reads it
+ * from its degree store) and the edges of the nodes that are not hubs. Hubs
+ * (more than g_n4s_hub_degree edges) stay out of the cache, so their reads go
+ * to op_find_edges, which pages them under the read deadline -- the previous
+ * version gave up on the whole chunk (a false "time limit") after
+ * downloading 50,001 rows. If the non-hub edges still exceed the cap, the
+ * nodes are packed by degree into requests that each fit. */
 static int op_prefetch_edges(void *ctx, const int64_t *ids, int n, bool by_target,
                              const char *const *types, int type_count) {
     n4s_ctx_t *x = ctx;
@@ -672,42 +820,127 @@ static int op_prefetch_edges(void *ctx, const int64_t *ids, int n, bool by_targe
             sorted[u++] = sorted[i];
         }
     }
-    const char *cypher =
-        by_target
-            ? "MATCH (b:CbmNode {db: $db, gen: $gen}) WHERE b.id IN $ids "
-              "MATCH (a:CbmNode)-[r]->(b) "
-              "WHERE a.db = $db AND a.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET
-              ", " N4S_FAR_COLS("a") " LIMIT $cap"
-            : "MATCH (a:CbmNode {db: $db, gen: $gen}) WHERE a.id IN $ids "
-              "MATCH (a)-[r]->(b:CbmNode) "
-              "WHERE b.db = $db AND b.gen = $gen AND ($types IS NULL OR r.type IN $types)" N4S_EDGE_RET
-              ", " N4S_FAR_COLS("b") " LIMIT $cap";
+    const char *edges_cypher = by_target ? N4S_PREFETCH_EDGES_TARGET : N4S_PREFETCH_EDGES_SOURCE;
     n4s_q_t q;
-    if (q_begin(x, &q, cypher) != 0) {
+    if (q_begin(x, &q,
+                by_target ? "MATCH (b:CbmNode {db: $db, gen: $gen}) WHERE b.id IN $ids "
+                            "RETURN b.id, COUNT { (b)<--() }"
+                          : "MATCH (a:CbmNode {db: $db, gen: $gen}) WHERE a.id IN $ids "
+                            "RETURN a.id, COUNT { (a)-->() }") != 0) {
         free(sorted);
         return CBM_STORE_ERR;
     }
     q_ids(&q, "ids", sorted, u);
-    q_int(&q, "cap", N4S_PREFETCH_EDGE_CAP + 1);
-    if (types && type_count > 0) {
-        q_types(&q, "types", (const char **)types, type_count);
-    } else {
-        yyjson_mut_obj_add_null(q.b.doc, q.params, "types");
+    q.params = cbm_neo4j_batch_add(&q.b, edges_cypher);
+    yyjson_mut_obj_add_strcpy(q.b.doc, q.params, "db", x->db);
+    yyjson_mut_obj_add_int(q.b.doc, q.params, "gen", x->gen);
+    prefetch_edge_params(&q, sorted, u, types, type_count);
+    cbm_neo4j_result_t res;
+    if (q_run(x, &q, &res) != CBM_STORE_OK) {
+        free(sorted);
+        return CBM_STORE_ERR;
     }
+    /* Degrees: hubs leave the cached id set (their reads are paged). */
+    yyjson_val *deg_rows = cbm_neo4j_result_data(&res, 0);
+    size_t nd = yyjson_arr_size(deg_rows);
+    n4s_degree_t *deg = nd > 0 ? calloc(nd, sizeof(*deg)) : NULL;
+    if (nd > 0 && !deg) {
+        cbm_neo4j_result_free(&res);
+        free(sorted);
+        return CBM_STORE_ERR;
+    }
+    yyjson_arr_iter dit = yyjson_arr_iter_with(deg_rows);
+    for (size_t i = 0; i < nd; i++) {
+        yyjson_val *e = yyjson_arr_iter_next(&dit);
+        deg[i].id = cbm_neo4j_val_int(cbm_neo4j_row_col(e, 0), 0);
+        deg[i].degree = cbm_neo4j_val_int(cbm_neo4j_row_col(e, 1), 0);
+    }
+    if (nd > 1) {
+        qsort(deg, nd, sizeof(*deg), cmp_degree_by_id);
+    }
+    int keep = 0; /* non-hub ids, still sorted; an id without a node has degree 0 */
+    for (int i = 0; i < u; i++) {
+        n4s_degree_t key = {sorted[i], 0};
+        const n4s_degree_t *d =
+            nd > 0 ? bsearch(&key, deg, nd, sizeof(*deg), cmp_degree_by_id) : NULL;
+        if (d && d->degree > g_n4s_hub_degree) {
+            continue;
+        }
+        sorted[keep++] = sorted[i];
+    }
+    u = keep;
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
     cbm_node_t *far = NULL;
     int far_count = 0;
-    if (collect_edges_ex(x, &q, &edges, &edge_count, &far, &far_count) != CBM_STORE_OK) {
+    int erc = edges_from_data(cbm_neo4j_result_data(&res, 1), &edges, &edge_count, &far, &far_count);
+    cbm_neo4j_result_free(&res);
+    if (erc != CBM_STORE_OK) {
+        free(deg);
         free(sorted);
         return CBM_STORE_ERR;
     }
-    if (edge_count > N4S_PREFETCH_EDGE_CAP) {
+    if (edge_count > g_n4s_prefetch_cap) {
+        /* Too many for one response: pack the non-hub nodes by degree into
+         * requests that each stay under the cap. */
         cbm_store_free_edges(edges, edge_count);
         cbm_store_free_nodes(far, far_count);
-        free(sorted);
-        return CBM_STORE_SCAN_LIMIT;
+        edges = NULL;
+        far = NULL;
+        edge_count = 0;
+        int cap_n = 0;
+        int start = 0;
+        int rc = CBM_STORE_OK;
+        while (start < u && rc == CBM_STORE_OK) {
+            int64_t sum = 0;
+            int end = start;
+            while (end < u) {
+                n4s_degree_t key = {sorted[end], 0};
+                const n4s_degree_t *d =
+                    nd > 0 ? bsearch(&key, deg, nd, sizeof(*deg), cmp_degree_by_id) : NULL;
+                int64_t dg = d ? d->degree : 0;
+                if (end > start && sum + dg > g_n4s_prefetch_cap) {
+                    break;
+                }
+                sum += dg;
+                end++;
+            }
+            n4s_q_t sq;
+            if (q_begin(x, &sq, edges_cypher) != 0) {
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            prefetch_edge_params(&sq, sorted + start, end - start, types, type_count);
+            cbm_edge_t *pe = NULL;
+            cbm_node_t *pn = NULL;
+            int pc = 0;
+            int pf = 0;
+            rc = collect_edges_ex(x, &sq, &pe, &pc, &pn, &pf);
+            if (rc == CBM_STORE_OK && pc > g_n4s_prefetch_cap) {
+                rc = CBM_STORE_ERR; /* degrees under-counted: give the hint up */
+            }
+            if (rc == CBM_STORE_OK) {
+                rc = edges_append(&edges, &far, &edge_count, &cap_n, pe, pn, pc);
+            }
+            if (rc != CBM_STORE_OK) {
+                cbm_store_free_edges(pe, pc);
+                cbm_store_free_nodes(pn, pf);
+            } else {
+                free(pe);
+                free(pn);
+            }
+            start = end;
+        }
+        far_count = edge_count;
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_edges(edges, edge_count);
+            cbm_store_free_nodes(far, far_count);
+            free(deg);
+            free(sorted);
+            return CBM_STORE_ERR;
+        }
     }
+    free(deg);
     if (edge_count > 1) {
         qsort(edges, (size_t)edge_count, sizeof(cbm_edge_t),
               by_target ? cmp_edge_by_target : cmp_edge_by_source);
@@ -809,7 +1042,7 @@ static int op_find_nodes_by_ids(void *ctx, const int64_t *ids, int n, cbm_node_t
         }
     }
     if (got > 1) {
-        qsort(arr, (size_t)got, sizeof(cbm_node_t), cmp_node_id);
+        qsort(arr, (size_t)got, sizeof(cbm_node_t), cbm_store_node_cmp_id);
     }
     *out = arr;
     *count = got;
@@ -1608,9 +1841,11 @@ static const char k_list_file_nodes[] =
     "WITH n.file_path AS path WHERE path <> '' "
     "RETURN DISTINCT path ORDER BY path";
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 const char *cbm_neo4j_test_list_file_nodes_cypher(void) {
     return k_list_file_nodes;
 }
+#endif
 
 /* The full cbm_store_list_files rule, for a graph without File paths. Its OR
  * keeps Neo4j off the label index, so it reads every node of the project. */
@@ -1803,6 +2038,10 @@ static uint64_t op_queries(void *ctx) {
     return ((n4s_ctx_t *)ctx)->queries;
 }
 
+static void op_set_read_deadline(void *ctx, uint64_t deadline_ms) {
+    ((n4s_ctx_t *)ctx)->read_deadline_ms = deadline_ms;
+}
+
 static const cbm_store_remote_ops_t k_neo4j_ops = {
     .close = op_close,
     .error = op_error,
@@ -1824,6 +2063,7 @@ static const cbm_store_remote_ops_t k_neo4j_ops = {
     .find_nodes_by_ids = op_find_nodes_by_ids,
     .find_nodes_by_files = op_find_nodes_by_files,
     .scan_nodes = op_scan_nodes,
+    .set_read_deadline = op_set_read_deadline,
 };
 
 /* ── Attach ─────────────────────────────────────────────────────── */
@@ -1947,18 +2187,9 @@ cbm_neo4j_attach_t cbm_neo4j_store_attach(cbm_store_t *s, const char *db_path, c
 
 /* ── Native Cypher ──────────────────────────────────────────────── */
 
-static char *n4s_strdup(const char *s) {
-    size_t n = strlen(s);
-    char *d = malloc(n + 1);
-    if (d) {
-        memcpy(d, s, n + 1);
-    }
-    return d;
-}
-
 static void native_fail(cbm_cypher_result_t *out, const char *msg) {
     free(out->error);
-    out->error = n4s_strdup(msg ? msg : "Neo4j query failed");
+    out->error = n4s_dup(msg ? msg : "Neo4j query failed");
 }
 
 /* query_graph is a read tool: refuse Cypher that could write. Keywords are
@@ -2028,7 +2259,8 @@ static const char *native_write_keyword(const char *q) {
 
 /* Statement 0 of r as a query_graph result, at most max_rows rows (0: the
  * legacy 100000). Returns 0, or -1 with out->error set. */
-static int native_rows(cbm_neo4j_result_t *r, int max_rows, cbm_cypher_result_t *out) {
+static int native_rows(cbm_neo4j_result_t *r, int max_rows, bool engine_compat,
+                       cbm_cypher_result_t *out) {
     yyjson_val *res0 = yyjson_arr_get_first(r->results);
     yyjson_val *cols = yyjson_obj_get(res0, "columns");
     yyjson_val *data = yyjson_obj_get(res0, "data");
@@ -2060,7 +2292,9 @@ static int native_rows(cbm_neo4j_result_t *r, int max_rows, cbm_cypher_result_t 
         }
         for (int j = 0; j < ncols; j++) {
             yyjson_val *v = cbm_neo4j_row_col(e, (size_t)j);
-            row[j] = cbm_neo4j_val_strdup(v, yyjson_is_null(v) ? "null" : "");
+            /* The engine renders a missing value as ""; native:true keeps
+             * Neo4j's null. */
+            row[j] = cbm_neo4j_val_strdup(v, yyjson_is_null(v) && !engine_compat ? "null" : "");
         }
         out->rows[i] = row;
         out->row_count = i + 1;
@@ -2163,7 +2397,95 @@ typedef struct {
     int pos;          /* byte offset in the original query */
     int seq;          /* order among insertions at the same offset */
     const char *text; /* inserted there */
+    int skip;         /* original bytes it replaces (0: a pure insertion) */
 } n4s_insert_t;
+
+/* "6", "-3", "1.5": a string literal Neo4j and the engine compare differently
+ * (the engine compares text; Neo4j a string with a number never matches). */
+static bool numeric_text(const char *s) {
+    if (!s || !*s) {
+        return false;
+    }
+    if (*s == '-') {
+        s++;
+    }
+    int digits = 0;
+    while (isdigit((unsigned char)*s)) {
+        s++;
+        digits++;
+    }
+    if (*s == '.') {
+        s++;
+        int frac = 0;
+        while (isdigit((unsigned char)*s)) {
+            s++;
+            frac++;
+        }
+        if (frac == 0) {
+            return false;
+        }
+    }
+    return digits > 0 && *s == '\0';
+}
+
+/* A variable-length hop range at the '*' of t[i], rewritten to what the
+ * engine runs: `*N` is 1..N there (exactly N in Neo4j), and every range is
+ * capped at cbm_cypher_max_depth() (Neo4j would walk an unbounded `*`).
+ * Appends to ins (numbers from nums[]); false with why[] when the range
+ * cannot be matched (its lower bound is past the cap). */
+static bool scope_hop_range(const cbm_token_t *t, int count, int i, int cap, n4s_insert_t *ins,
+                            int *nins, char (*nums)[24], char *why, size_t why_sz) {
+    int j = i + 1;
+    const cbm_token_t *lo = j < count && t[j].type == TOK_NUMBER ? &t[j] : NULL;
+    if (lo) {
+        j++;
+    }
+    const cbm_token_t *dots = j < count && t[j].type == TOK_DOTDOT ? &t[j] : NULL;
+    if (dots) {
+        j++;
+    }
+    const cbm_token_t *hi = dots && j < count && t[j].type == TOK_NUMBER ? &t[j] : NULL;
+    long lo_v = lo ? strtol(lo->text, NULL, 10) : 1;
+    long hi_v = hi ? strtol(hi->text, NULL, 10) : 0;
+    n4s_insert_t *e = &ins[*nins];
+    char *num = nums[*nins];
+    memset(e, 0, sizeof(*e));
+    e->seq = *nins;
+    if (!lo && !dots) { /* * -> *1..cap */
+        (void)snprintf(num, 24, "1..%d", cap);
+        e->pos = t[i].pos + 1;
+    } else if (lo && !dots) { /* *N -> *1..N (N capped) */
+        if (lo_v > cap) {
+            (void)snprintf(num, 24, "1..%d", cap);
+            e->skip = (int)strlen(lo->text);
+        } else {
+            (void)snprintf(num, 24, "1..");
+        }
+        e->pos = lo->pos;
+    } else {
+        if (lo && lo_v > cap) {
+            if (why) {
+                (void)snprintf(why, why_sz,
+                               "its hop range starts beyond the engine's depth limit (%d)", cap);
+            }
+            return false;
+        }
+        if (hi) { /* *N..M / *..M: M capped */
+            if (hi_v <= cap) {
+                return true;
+            }
+            (void)snprintf(num, 24, "%d", cap);
+            e->pos = hi->pos;
+            e->skip = (int)strlen(hi->text);
+        } else { /* *N.. / *.. -> upper bound cap */
+            (void)snprintf(num, 24, "%d", cap);
+            e->pos = dots->pos + 2;
+        }
+    }
+    e->text = num;
+    (*nins)++;
+    return true;
+}
 
 static int cmp_insert(const void *a, const void *b) {
     const n4s_insert_t *x = a;
@@ -2198,17 +2520,45 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
     }
     const cbm_token_t *t = lx.tokens;
     int count = lx.count;
-    /* up to three insertions per node pattern: label, its closing ')', scope */
-    n4s_insert_t *ins = calloc((size_t)count * 3 + 1, sizeof(n4s_insert_t));
-    if (!ins) {
+    /* up to three insertions per node pattern (label, its closing ')',
+     * scope) and one per hop range */
+    n4s_insert_t *ins = calloc((size_t)count * 4 + 1, sizeof(n4s_insert_t));
+    char(*nums)[24] = calloc((size_t)count * 4 + 1, sizeof(*nums));
+    if (!ins || !nums) {
+        free(ins);
+        free(nums);
         cbm_lex_free(&lx);
         return NULL;
     }
     int nins = 0;
     bool in_match = false; /* inside a MATCH clause's pattern list */
+    bool in_rel = false;   /* inside a relationship's [ ] */
+    const int depth_cap = cbm_cypher_max_depth();
     bool ok = true;
     for (int i = 0; i < count && ok; i++) {
         cbm_token_type_t ty = t[i].type;
+        if (ty == TOK_LBRACKET) {
+            in_rel = i > 0 && t[i - 1].type == TOK_DASH; /* -[ ... ] or <-[ ... ] */
+        } else if (ty == TOK_RBRACKET) {
+            in_rel = false;
+        }
+        if (ty == TOK_STRING && numeric_text(t[i].text)) {
+            if (why) {
+                (void)snprintf(why, why_sz,
+                               "it compares with a numeric string ('%.20s'): the engine compares "
+                               "text, Neo4j typed values",
+                               t[i].text);
+            }
+            ok = false;
+            break;
+        }
+        if (ty == TOK_STAR && in_rel) {
+            if (!scope_hop_range(t, count, i, depth_cap, ins, &nins, nums, why, why_sz)) {
+                ok = false;
+                break;
+            }
+            continue;
+        }
         if (ty == TOK_MATCH) {
             in_match = true;
         } else if (ty == TOK_WHERE || ty == TOK_RETURN || ty == TOK_WITH || ty == TOK_UNWIND ||
@@ -2330,11 +2680,16 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
         nins++;
     }
     cbm_lex_free(&lx);
-    if (!ok || nins == 0) {
+    bool scoped_any = false;
+    for (int k = 0; k < nins && !scoped_any; k++) {
+        scoped_any = strstr(ins[k].text, "$db") != NULL;
+    }
+    if (!ok || !scoped_any) {
         if (ok && why) {
             (void)snprintf(why, why_sz, "no node pattern to scope");
         }
         free(ins);
+        free(nums);
         return NULL;
     }
     qsort(ins, (size_t)nins, sizeof(n4s_insert_t), cmp_insert);
@@ -2346,14 +2701,16 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
     char *outq = malloc(qlen + extra + 1);
     if (!outq) {
         free(ins);
+        free(nums);
         return NULL;
     }
     size_t w = 0;
     size_t from = 0;
     for (int k = 0; k < nins; k++) {
         size_t at = (size_t)ins[k].pos;
-        if (at > qlen || at < from) {
+        if (at > qlen || at < from || at + (size_t)ins[k].skip > qlen) {
             free(ins);
+            free(nums);
             free(outq);
             if (why) {
                 (void)snprintf(why, why_sz, "token positions are inconsistent");
@@ -2365,17 +2722,18 @@ char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz) {
         size_t tl = strlen(ins[k].text);
         memcpy(outq + w, ins[k].text, tl);
         w += tl;
-        from = at;
+        from = at + (size_t)ins[k].skip;
     }
     memcpy(outq + w, query + from, qlen - from);
     w += qlen - from;
     outq[w] = '\0';
     free(ins);
+    free(nums);
     return outq;
 }
 
-int cbm_neo4j_native_query(const char *db_path, const char *project, const char *query,
-                           int max_rows, cbm_cypher_result_t *out) {
+int cbm_neo4j_native_query_ex(const char *db_path, const char *project, const char *query,
+                              int max_rows, bool engine_compat, cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
     const char *kw = native_write_keyword(query);
     if (kw) {
@@ -2413,12 +2771,18 @@ int cbm_neo4j_native_query(const char *db_path, const char *project, const char 
         op_close(x);
         return -1;
     }
-    int rc = native_rows(&r, max_rows, out);
+    int rc = native_rows(&r, max_rows, engine_compat, out);
     cbm_neo4j_result_free(&r);
     op_close(x);
     return rc;
 }
 
+int cbm_neo4j_native_query(const char *db_path, const char *project, const char *query,
+                           int max_rows, cbm_cypher_result_t *out) {
+    return cbm_neo4j_native_query_ex(db_path, project, query, max_rows, false, out);
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
 /* Tests: a raw Neo4j response body, checked like cbm_neo4j_batch_run checks
  * one, read through the same row conversion the store uses. */
 static int test_result_from_body(const char *body, cbm_neo4j_result_t *r) {
@@ -2438,7 +2802,7 @@ int cbm_neo4j_test_native_rows(const char *body, int max_rows, cbm_cypher_result
         native_fail(out, "unparseable test body");
         return -1;
     }
-    int rc = native_rows(&r, max_rows, out);
+    int rc = native_rows(&r, max_rows, false, out);
     cbm_neo4j_result_free(&r);
     return rc;
 }
@@ -2452,3 +2816,4 @@ int cbm_neo4j_test_column_strings(const char *body, char ***out, int *count) {
     cbm_neo4j_result_free(&r);
     return rc;
 }
+#endif /* CBM_ENABLE_TEST_SEAMS */

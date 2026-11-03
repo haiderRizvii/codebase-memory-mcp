@@ -339,6 +339,10 @@ typedef struct {
     /* True when the query failed because it ran past its wall-clock budget
      * (error is then the "execution time limit" message). */
     bool timed_out;
+    /* True when the query failed because more than the 100k-row ceiling
+     * had to be ranked by ORDER BY: the engine keeps only the first 100k
+     * rows it meets, so it cannot tell which ones rank first. */
+    bool row_ceiling;
 } cbm_cypher_result_t;
 
 /* Execute a Cypher query against a store.
@@ -367,6 +371,12 @@ void cbm_cypher_result_free(cbm_cypher_result_t *r);
  * (UNION, UNWIND, OPTIONAL first pattern). Lets a caller estimate the work
  * before running it. */
 int cbm_cypher_start_scan(const char *query, char *label, size_t label_sz, bool *expands);
+
+/* The column names the engine gives query's result (alias, "COUNT(x)",
+ * "n.name", ...): *names (count entries, each heap-allocated, free with
+ * free()) and 1; 0 when they cannot be known without running it (no parse,
+ * RETURN *, no RETURN). A UNION is named by its first part. */
+int cbm_cypher_column_names(const char *query, char ***names, int *count);
 
 /* Convenience: lex + parse in one step. */
 int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error);

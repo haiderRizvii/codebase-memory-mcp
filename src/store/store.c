@@ -3489,14 +3489,18 @@ int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char
 int cbm_store_prefetch_edges(cbm_store_t *s, const int64_t *ids, int n, bool by_target,
                              const char *const *types, int type_count) {
     if (s && s->remote_ops && s->remote_ops->prefetch_edges && ids && n > 0) {
-        /* A failed prefetch only means the reads go one by one. */
-        int rc =
-            s->remote_ops->prefetch_edges(s->remote_ctx, ids, n, by_target, types, type_count);
-        if (rc == CBM_STORE_SCAN_LIMIT) {
-            return rc;
-        }
+        /* A failed prefetch only means the reads go one by one; the error
+         * stays readable through cbm_store_error. */
+        (void)remote_status(s, s->remote_ops->prefetch_edges(s->remote_ctx, ids, n, by_target,
+                                                             types, type_count));
     }
     return CBM_STORE_OK;
+}
+
+void cbm_store_set_read_deadline(cbm_store_t *s, uint64_t deadline_ms) {
+    if (s && s->remote_ops && s->remote_ops->set_read_deadline) {
+        s->remote_ops->set_read_deadline(s->remote_ctx, deadline_ms);
+    }
 }
 
 void cbm_store_prefetch_clear(cbm_store_t *s) {
@@ -3530,7 +3534,7 @@ static int nodes_append(cbm_node_t **arr, int *count, int *cap, cbm_node_t *src,
     return CBM_STORE_OK;
 }
 
-static int cmp_node_by_id(const void *a, const void *b) {
+int cbm_store_node_cmp_id(const void *a, const void *b) {
     int64_t x = ((const cbm_node_t *)a)->id;
     int64_t y = ((const cbm_node_t *)b)->id;
     return (x > y) - (x < y);
@@ -3564,7 +3568,7 @@ int cbm_store_find_nodes_by_ids(cbm_store_t *s, const int64_t *ids, int n, cbm_n
         }
     }
     if (got > 1) {
-        qsort(arr, (size_t)got, sizeof(cbm_node_t), cmp_node_by_id);
+        qsort(arr, (size_t)got, sizeof(cbm_node_t), cbm_store_node_cmp_id);
     }
     *out = arr;
     *count = got;
@@ -3682,6 +3686,12 @@ static atomic_int node_scan_test_fail_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND)
 void cbm_store_node_scan_test_fail_page_after(int successful_pages) {
     atomic_store(&node_scan_test_fail_countdown, successful_pages);
 }
+
+static atomic_int edge_read_test_fail_countdown = ATOMIC_VAR_INIT(CBM_NOT_FOUND);
+
+void cbm_store_test_fail_edge_read_after(int successful_reads) {
+    atomic_store(&edge_read_test_fail_countdown, successful_reads);
+}
 #endif
 
 /* True when SQLite runs `sql` as the single index search `plan`. */
@@ -3779,14 +3789,15 @@ static void node_scan_bind(cbm_store_node_scan_t *scan, sqlite3_stmt *stmt, node
     sqlite3_bind_int(stmt, col, max);
 }
 
-/* One page of the current phase into out[0..max). A short page ends the
- * phase; the statement is reset before returning either way. */
+/* Rows per remote scan page (tests shrink it on their own thread). */
 #define NODE_SCAN_REMOTE_PAGE 100000
-static int g_node_scan_remote_page = NODE_SCAN_REMOTE_PAGE;
+static _Thread_local int g_node_scan_remote_page = NODE_SCAN_REMOTE_PAGE;
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 void cbm_store_test_set_remote_scan_page(int rows) {
     g_node_scan_remote_page = rows > 0 ? rows : NODE_SCAN_REMOTE_PAGE;
 }
+#endif
 
 /* Refill rbuf with the next remote page. */
 static int node_scan_remote_fill(cbm_store_node_scan_t *scan) {
@@ -3853,6 +3864,8 @@ static int node_scan_page_remote(cbm_store_node_scan_t *scan, cbm_node_t *out, i
     return CBM_STORE_OK;
 }
 
+/* One page of the current phase into out[0..max). A short page ends the
+ * phase; the statement is reset before returning either way. */
 static int node_scan_page(cbm_store_node_scan_t *scan, cbm_node_t *out, int max, int *got) {
     if (scan->remote_paged) {
         return node_scan_page_remote(scan, out, max, got);
@@ -4378,6 +4391,14 @@ static int find_edges_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
         *count = 0;
         return CBM_STORE_ERR;
     }
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (graph_compare_test_countdown_fires(&edge_read_test_fail_countdown)) {
+        *out = NULL;
+        *count = 0;
+        snprintf(s->errbuf, sizeof(s->errbuf), "edge read aborted: injected failure");
+        return CBM_STORE_ERR;
+    }
+#endif
     sqlite3_stmt *stmt = prepare_cached(s, slot, sql);
     if (!stmt) {
         return CBM_STORE_ERR;

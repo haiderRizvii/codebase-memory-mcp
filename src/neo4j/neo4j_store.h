@@ -30,6 +30,10 @@ cbm_neo4j_attach_t cbm_neo4j_store_attach(cbm_store_t *s, const char *db_path, c
  * Returns 0, or -1 with out->error set. */
 int cbm_neo4j_native_query(const char *db_path, const char *project, const char *query,
                            int max_rows, cbm_cypher_result_t *out);
+/* As cbm_neo4j_native_query; engine_compat renders a missing value as ""
+ * like the in-process engine (query_graph's fallback), not as null. */
+int cbm_neo4j_native_query_ex(const char *db_path, const char *project, const char *query,
+                              int max_rows, bool engine_compat, cbm_cypher_result_t *out);
 
 /* query_graph's engine dialect rewritten for Neo4j: every node pattern is
  * scoped to the project's current graph (:CbmNode and {db: $db, gen: $gen,
@@ -38,6 +42,7 @@ int cbm_neo4j_native_query(const char *db_path, const char *project, const char 
  * it reads the engine-only virtual properties in_degree / out_degree. */
 char *cbm_neo4j_scope_query(const char *query, char *why, size_t why_sz);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 /* Tests: the Cypher cbm_store_list_files asks Neo4j first (File nodes only),
  * so a test can check which index Neo4j plans it with. */
 const char *cbm_neo4j_test_list_file_nodes_cypher(void);
@@ -47,5 +52,10 @@ const char *cbm_neo4j_test_list_file_nodes_cypher(void);
  * query_graph use, without a server. */
 int cbm_neo4j_test_column_strings(const char *body, char ***out, int *count);
 int cbm_neo4j_test_native_rows(const char *body, int max_rows, cbm_cypher_result_t *out);
+
+/* Tests: edges per prefetch request, the hub degree and rows per edge page
+ * (each <= 0 restores its default), on the calling thread. */
+void cbm_neo4j_test_set_edge_limits(int prefetch_cap, int hub_degree, int edge_page);
+#endif
 
 #endif /* CBM_NEO4J_STORE_H */

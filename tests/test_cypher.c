@@ -6363,6 +6363,108 @@ TEST(cypher_stream_limit_and_max_rows_across_chunks) {
  * hold 7 rows at chunk 7; the store seam fails a page after earlier pages
  * delivered rows (the all-nodes scan's first page is its empty NULL
  * file_path pass, hence one more page before the fault). */
+/* A failed edge read mid-walk fails the query with the store's error; it
+ * used to leave the walk short and answer a silently low count. */
+TEST(cypher_edge_read_failure_fails_query) {
+    cbm_store_t *s = setup_reference_store();
+    cbm_cypher_result_t r;
+    const char *q = "MATCH (a:Function)-[:CALLS]->(b) RETURN count(*)";
+    ASSERT_EQ(stream_run(s, q, 0, 7, &r), 0);
+    ASSERT_GT(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_test_fail_edge_read_after(2);
+    int rc = stream_run(s, q, 0, 7, &r);
+    cbm_store_test_fail_edge_read_after(-1);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    ASSERT_TRUE(strstr(r.error, "reading the graph failed") != NULL);
+    ASSERT_TRUE(strstr(r.error, "injected failure") != NULL);
+    ASSERT_FALSE(r.timed_out); /* not a time-out: no other path may answer it */
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+    /* the fault does not outlive its query */
+    ASSERT_EQ(stream_run(s, q, 0, 7, &r), 0);
+    ASSERT_NULL(r.error);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* cbm_cypher_column_names names columns exactly as executing the query does. */
+TEST(cypher_column_names_match_engine) {
+    cbm_store_t *s = setup_reference_store();
+    static const char *const queries[] = {
+        "MATCH (n:Function) RETURN n.name, count(n) AS c",
+        "MATCH (a)-[:CALLS]->(b) RETURN COUNT(b)",
+        "MATCH (a)-[:CALLS]->(b) RETURN count(b), a.name",
+        "MATCH (n:Function) RETURN n",
+        "MATCH (a:Function) RETURN a.name AS n UNION MATCH (b:Function) RETURN b.name AS n",
+        NULL};
+    for (int i = 0; queries[i]; i++) {
+        char **names = NULL;
+        int count = 0;
+        ASSERT_EQ(cbm_cypher_column_names(queries[i], &names, &count), 1);
+        cbm_cypher_result_t r;
+        ASSERT_EQ(stream_run(s, queries[i], 0, 0, &r), 0);
+        ASSERT_EQ(count, r.col_count);
+        for (int c = 0; c < count; c++) {
+            ASSERT_STR_EQ(names[c], r.columns[c]);
+            free(names[c]);
+        }
+        free(names);
+        cbm_cypher_result_free(&r);
+    }
+    char **names = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_cypher_column_names("MATCH (n) RETURN *", &names, &count), 0);
+    ASSERT_EQ(cbm_cypher_column_names("MATCH (n RETURN", &names, &count), 0);
+    ASSERT_NULL(names);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Past the 100k-row ceiling the engine answers the first 100k rows, marked
+ * truncated (as Neo4j's native answer is) -- except when ORDER BY would rank
+ * rows the cap dropped: that is an error query_graph can hand to Neo4j. */
+TEST(cypher_row_ceiling_truncates_unless_ordered) {
+    enum { CEIL_NODES = 100050 };
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t *nodes = calloc(CEIL_NODES, sizeof(cbm_node_t));
+    char (*names)[16] = calloc(CEIL_NODES, sizeof(*names));
+    ASSERT_NOT_NULL(nodes);
+    ASSERT_NOT_NULL(names);
+    for (int i = 0; i < CEIL_NODES; i++) {
+        snprintf(names[i], sizeof(names[i]), "v%06d", i);
+        nodes[i] = (cbm_node_t){.project = "test", .label = "Variable", .name = names[i],
+                                .qualified_name = names[i], .file_path = "big.c",
+                                .start_line = 1, .end_line = 1, .properties_json = "{}"};
+    }
+    int batch_rc = cbm_store_upsert_node_batch(s, nodes, CEIL_NODES, NULL);
+    free(nodes);
+    free(names);
+    ASSERT_EQ(batch_rc, CBM_STORE_OK);
+    cbm_cypher_result_t r;
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (n:Variable) RETURN n.name", "test", 0, &r), 0);
+    ASSERT_EQ(r.row_count, 100000);
+    ASSERT_TRUE(r.truncated);
+    ASSERT_NULL(r.error);
+    cbm_cypher_result_free(&r);
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (n:Variable) RETURN n.name ORDER BY n.name DESC",
+                                 "test", 0, &r),
+              -1);
+    ASSERT_TRUE(r.row_ceiling);
+    ASSERT_FALSE(r.timed_out);
+    ASSERT_NOT_NULL(r.error);
+    cbm_cypher_result_free(&r);
+    ASSERT_EQ(cbm_cypher_execute(s, "MATCH (n:Variable) RETURN count(n) AS c", "test", 0, &r), 0);
+    ASSERT_STR_EQ(r.rows[0][0], "100050");
+    ASSERT_FALSE(r.truncated);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_stream_scan_failure_fails_query) {
     static const struct {
         const char *query;
@@ -6498,6 +6600,9 @@ TEST(cypher_start_scan_reports_the_first_scan) {
 SUITE(cypher) {
     /* Lexer */
     RUN_TEST(cypher_start_scan_reports_the_first_scan);
+    RUN_TEST(cypher_edge_read_failure_fails_query);
+    RUN_TEST(cypher_column_names_match_engine);
+    RUN_TEST(cypher_row_ceiling_truncates_unless_ordered);
     RUN_TEST(cypher_lex_simple_match);
     RUN_TEST(cypher_lex_relationship);
     RUN_TEST(cypher_lex_string_literal);

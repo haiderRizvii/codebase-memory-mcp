@@ -475,6 +475,10 @@ typedef struct cbm_store_remote_ops {
     int (*scan_nodes)(void *ctx, const char *project, const char *label, bool keyed,
                       const char *after_file, int64_t after_id, int max, cbm_node_t **out,
                       int *count);
+    /* Optional. Wall-clock ms (cbm_now_ms) after which a read that takes
+     * several round trips stops between them with CBM_STORE_SCAN_LIMIT;
+     * 0 = no limit. */
+    void (*set_read_deadline)(void *ctx, uint64_t deadline_ms);
 } cbm_store_remote_ops_t;
 
 /* Batched reads. On a local store these loop over the single-row reads; on a
@@ -483,22 +487,30 @@ typedef struct cbm_store_remote_ops {
 /* Hint: the caller is about to read the edges (in one direction, of types;
  * type_count 0 = all) of every node in ids, and the nodes at their far
  * ends. A no-op on a local store; never changes what a read returns.
- * Returns CBM_STORE_SCAN_LIMIT when a remote backend found more edges than
- * it prefetches at once (reading them would pull a large share of the graph
- * over the network), else CBM_STORE_OK -- also when the prefetch failed. */
+ * CBM_STORE_OK, also when the prefetch failed (cbm_store_error says why):
+ * the reads then go one by one. */
 int cbm_store_prefetch_edges(cbm_store_t *s, const int64_t *ids, int n, bool by_target,
                              const char *const *types, int type_count);
 /* Drop what cbm_store_prefetch_edges cached (call when the walk is done). */
 void cbm_store_prefetch_clear(cbm_store_t *s);
+/* Remote reads that take several round trips (a hub's edges) stop between
+ * them once cbm_now_ms() reaches deadline_ms, returning CBM_STORE_SCAN_LIMIT;
+ * 0 removes the limit. A no-op on a local store. */
+void cbm_store_set_read_deadline(cbm_store_t *s, uint64_t deadline_ms);
 /* Nodes for ids, sorted by id; ids without a node are skipped. */
 int cbm_store_find_nodes_by_ids(cbm_store_t *s, const int64_t *ids, int n, cbm_node_t **out,
                                 int *count);
+/* qsort/bsearch comparator of cbm_node_t by id (ascending). */
+int cbm_store_node_cmp_id(const void *a, const void *b);
 /* Nodes of each file (as cbm_store_find_nodes_by_file), concatenated in the
  * order of files, by id within a file. */
 int cbm_store_find_nodes_by_files(cbm_store_t *s, const char *project, const char *const *files,
                                   int n, cbm_node_t **out, int *count);
-/* Tests: rows per remote node-scan page (<= 0 restores the default). */
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Tests: rows per remote node-scan page (<= 0 restores the default), on the
+ * calling thread. */
 void cbm_store_test_set_remote_scan_page(int rows);
+#endif
 
 /* Route this store's graph reads to a remote backend. The store owns ctx
  * from now on and releases it with ops->close in cbm_store_close. */
@@ -793,6 +805,9 @@ void cbm_store_node_scan_close(cbm_store_node_scan_t *scan);
 /* One-shot fault: after this many successful pages (of any scan), the next
  * page fails like a SQLite step error; -1 disables the seam. */
 void cbm_store_node_scan_test_fail_page_after(int successful_pages);
+/* One-shot fault: after this many successful local edge reads, the next one
+ * fails like a SQLite error; -1 disables the seam. */
+void cbm_store_test_fail_edge_read_after(int successful_reads);
 #endif
 
 /* Return a stable, paginated outline for one exact repository-relative file.
