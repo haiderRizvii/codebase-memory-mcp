@@ -9,6 +9,7 @@
  *     build/c/test-runner neo4j
  */
 #include "../src/foundation/compat.h"
+#include "foundation/limits.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "neo4j/neo4j_client.h"
@@ -1484,6 +1485,41 @@ TEST(neo4j_scope_query_scopes_every_node_pattern) {
     /* regex dialects differ (POSIX ERE vs Java) */
     SCOPE_EXPECT("MATCH (n) WHERE n.name =~ 'v[[:digit:]]+' RETURN count(n)", NULL);
     SCOPE_EXPECT("MATCH (n {project: 'other'}) RETURN n", NULL);
+    /* hop ranges read as the engine reads them: *N is 1..N, all capped */
+    {
+        int cap = cbm_cypher_max_depth();
+        char want[512];
+        char q[256];
+#define SC ":CbmNode {db: $db, gen: $gen, project: $project}"
+        snprintf(want, sizeof(want), "MATCH (a" SC ")-[:CALLS*1..3]->(b" SC ") RETURN count(b)");
+        SCOPE_EXPECT("MATCH (a)-[:CALLS*3]->(b) RETURN count(b)", want);
+        snprintf(want, sizeof(want), "MATCH (a" SC ")-[*1..%d]->(b" SC ") RETURN b", cap);
+        SCOPE_EXPECT("MATCH (a)-[*]->(b) RETURN b", want);
+        snprintf(want, sizeof(want), "MATCH (a" SC ")-[r:CALLS*2..%d]->(b" SC ") RETURN b", cap);
+        SCOPE_EXPECT("MATCH (a)-[r:CALLS*2..]->(b) RETURN b", want);
+        snprintf(want, sizeof(want), "MATCH (a" SC ")<-[*..%d]-(b" SC ") RETURN b", cap);
+        SCOPE_EXPECT("MATCH (a)<-[*..]-(b) RETURN b", want);
+        if (cap >= 4) {
+            SCOPE_EXPECT("MATCH (a)-[*..4]-(b) RETURN b",
+                         "MATCH (a" SC ")-[*..4]-(b" SC ") RETURN b");
+        }
+        snprintf(q, sizeof(q), "MATCH (a)-[*1..%d]->(b) RETURN b", cap + 50);
+        snprintf(want, sizeof(want), "MATCH (a" SC ")-[*1..%d]->(b" SC ") RETURN b", cap);
+        SCOPE_EXPECT(q, want);
+        snprintf(q, sizeof(q), "MATCH (a)-[*%d]->(b) RETURN b", cap + 50);
+        SCOPE_EXPECT(q, want);
+        snprintf(q, sizeof(q), "MATCH (a)-[*%d..]->(b) RETURN b", cap + 1);
+        SCOPE_EXPECT(q, NULL); /* starts past the engine's limit */
+        /* a '*' outside a relationship is untouched */
+        SCOPE_EXPECT("MATCH (n) RETURN count(*)", "MATCH (n" SC ") RETURN count(*)");
+        SCOPE_EXPECT("MATCH (n) RETURN n.start_line * 2", "MATCH (n" SC ") RETURN n.start_line * 2");
+#undef SC
+    }
+    /* the engine compares text, Neo4j typed values: '6' would not match 6 */
+    SCOPE_EXPECT("MATCH (n) WHERE n.start_line = '6' RETURN n", NULL);
+    SCOPE_EXPECT("MATCH (n {start_line: '-1.5'}) RETURN n", NULL);
+    SCOPE_EXPECT("MATCH (n {name: '2fa'}) RETURN n",
+                 "MATCH (n :CbmNode {db: $db, gen: $gen, project: $project, name: '2fa'}) RETURN n");
     SCOPE_EXPECT("MATCH ()-[r:CALLS]->() RETURN count(r)",
                  "MATCH (:CbmNode {db: $db, gen: $gen, project: $project})-[r:CALLS]->(:CbmNode {db: $db, gen: $gen, project: $project}) "
                  "RETURN count(r)");
@@ -1626,6 +1662,36 @@ TEST(neo4j_live_engine_reads_match_local) {
         }
         ASSERT_STR_EQ(got, want);
     }
+
+    /* Hubs and paging, with tiny limits: the hub (1,200 callers) is left out
+     * of every prefetch and read in pages of 70; 512 callers (~517 edges)
+     * overflow a 300-edge prefetch and are packed into smaller requests.
+     * Answers stay those of the local index. */
+    cbm_neo4j_test_set_edge_limits(300, 50, 70);
+    for (int i = 0; queries[i]; i++) {
+        cypher_signature(local, queries[i], want, sizeof(want));
+        cypher_signature(remote, queries[i], got, sizeof(got));
+        if (strcmp(want, got) != 0) {
+            printf("  [paged] query: %s\n   local:  %.300s\n   neo4j:  %.300s\n", queries[i], want,
+                   got);
+        }
+        ASSERT_STR_EQ(got, want);
+    }
+    /* A paged read stops between pages at the read deadline. */
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_set_read_deadline(remote, 1); /* long past */
+    ASSERT_EQ(cbm_store_find_edges_by_target(remote, hub_id, &edges, &edge_count),
+              CBM_STORE_SCAN_LIMIT);
+    ASSERT_NULL(edges);
+    cbm_store_set_read_deadline(remote, 0);
+    ASSERT_EQ(cbm_store_find_edges_by_target(remote, hub_id, &edges, &edge_count), CBM_STORE_OK);
+    ASSERT_EQ(edge_count, CALLERS);
+    for (int i = 1; i < edge_count; i++) {
+        ASSERT_TRUE(edges[i - 1].id < edges[i].id); /* r.id order across pages */
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_neo4j_test_set_edge_limits(0, 0, 0);
 
     /* The hub's callers: a few round trips, not one per caller. */
     cbm_store_backend_usage_reset(remote);

@@ -52,7 +52,7 @@ typedef int cbm_n4_sock_t;
  * a blocking connect() for the OS's SYN retries (a minute or more). */
 #define N4_CONNECT_MS 10000
 
-enum { N4_STALL_NONE = 0, N4_STALL_DEAD, N4_STALL_LIMIT };
+enum { N4_STALL_NONE = 0, N4_STALL_DEAD, N4_STALL_LIMIT, N4_STALL_TOO_LARGE };
 #define N4_HDR_MAX (64U * 1024U)
 #define N4_RESP_MAX ((size_t)1 << 30) /* 1 GiB: refuse anything larger */
 
@@ -345,6 +345,9 @@ static void n4_io_err(const cbm_neo4j_http_t *h, char *err, size_t err_sz, const
                        "%s:%d got no answer either (server down, hung or unreachable)",
                        N4_STALL_TICK_MS / 1000, h->url.host, h->url.port);
         n4_err(err, err_sz, "%s", buf);
+    } else if (h->stall == N4_STALL_TOO_LARGE) {
+        n4_err(err, err_sz,
+               "Neo4j response exceeded 1 GiB%s — add LIMIT or narrow the query", NULL);
     } else if (h->stall == N4_STALL_LIMIT) {
         (void)snprintf(buf, sizeof(buf),
                        "no reply from Neo4j within %d s (the server is up, but did not answer "
@@ -437,6 +440,9 @@ static int n4_buf_reserve(n4_buf_t *b, size_t extra) {
  * is waited for up to max_wait_ms in all (stall LIMIT). */
 static int n4_recv_more(cbm_neo4j_http_t *h, n4_buf_t *b) {
     if (n4_buf_reserve(b, 16384) != 0) {
+        if (b->len + 16384 + 1 > N4_RESP_MAX + N4_HDR_MAX) {
+            h->stall = N4_STALL_TOO_LARGE; /* not the network: the size cap */
+        }
         return -1;
     }
     int limit = h->max_wait_ms > 0 ? h->max_wait_ms : N4_IO_TIMEOUT_MS;
@@ -603,6 +609,7 @@ static int n4_sock_more(void *src, n4_buf_t *b) {
     return n4_recv_more(src, b);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 typedef struct {
     const char *raw;
     size_t len;
@@ -648,6 +655,7 @@ int cbm_neo4j_test_dechunk(const char *raw, size_t raw_len, size_t step, char **
     *buffered = b.len;
     return 0;
 }
+#endif /* CBM_ENABLE_TEST_SEAMS */
 
 /* One request/response exchange over the plain socket. Returns 0 on success,
  * -1 on transport failure; *retryable is set when the failure happened on a

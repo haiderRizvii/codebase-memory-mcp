@@ -2771,6 +2771,10 @@ static bool eval_comparison_op(const char *op, const char *actual, const char *e
     return false;
 }
 
+/* Store-read result checks (defined with the execution budget below). */
+static bool cypher_read_ok(int rc, cbm_store_t *store);
+static void cypher_edges_checked(int rc, cbm_store_t *store, cbm_edge_t **edges, int *count);
+
 enum { EXISTS_DIR_OUT = 0, EXISTS_DIR_IN = 1 };
 
 /* EXISTS { (var)-[:TYPE]->() }: does the bound node have any edge of the
@@ -2783,9 +2787,12 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
         int cnt = 0;
         if (c->exists_dir != EXISTS_DIR_IN) { /* outbound or any */
             if (c->value) {
-                cbm_store_find_edges_by_source_type(b->store, n->id, c->value, &edges, &cnt);
+                cypher_edges_checked(
+                    cbm_store_find_edges_by_source_type(b->store, n->id, c->value, &edges, &cnt),
+                    b->store, &edges, &cnt);
             } else {
-                cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
+                cypher_edges_checked(cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt),
+                                     b->store, &edges, &cnt);
             }
             result = cnt > 0;
             cbm_store_free_edges(edges, cnt);
@@ -2794,9 +2801,12 @@ static bool eval_exists_condition(const cbm_condition_t *c, binding_t *b) {
             edges = NULL;
             cnt = 0;
             if (c->value) {
-                cbm_store_find_edges_by_target_type(b->store, n->id, c->value, &edges, &cnt);
+                cypher_edges_checked(
+                    cbm_store_find_edges_by_target_type(b->store, n->id, c->value, &edges, &cnt),
+                    b->store, &edges, &cnt);
             } else {
-                cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
+                cypher_edges_checked(cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt),
+                                     b->store, &edges, &cnt);
             }
             result = cnt > 0;
             cbm_store_free_edges(edges, cnt);
@@ -3263,6 +3273,9 @@ static _Thread_local bool g_cypher_timed_out = false;
 /* Sticky for one cbm_cypher_execute call. Unlike row_count, this survives caps
  * that happen before DISTINCT, aggregation, ORDER BY, or the final projection. */
 static _Thread_local bool g_cypher_truncated = false;
+/* The row cap cut a projection that ORDER BY still has to rank: the rows
+ * kept are the first ones met, not the first ones in order. */
+static _Thread_local bool g_cypher_ordered_cut = false;
 /* Set when the streamed start-node scan failed in this execution: the query
  * fails with this store error rather than answer from the rows read so far. */
 static _Thread_local char g_cypher_scan_error[CBM_SZ_512];
@@ -3286,8 +3299,16 @@ static uint64_t cypher_deadline_now(void) {
     return cbm_now_ms();
 }
 
+/* A store read failed during this execution: every loop stops (through
+ * cypher_deadline_exceeded) and the query fails with the store's error
+ * (g_cypher_scan_error) instead of answering from what it read -- before,
+ * a Neo4j failure mid-walk came back as a silently low count. Not a time-out:
+ * query_graph must not answer such a query another way. */
+static _Thread_local bool g_cypher_read_failed = false;
+
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
+    g_cypher_read_failed = false;
     int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
                      : g_cypher_budget_ms > 0             ? g_cypher_budget_ms
                                                           : CYPHER_DEADLINE_BUDGET_MS;
@@ -3297,7 +3318,7 @@ static void cypher_deadline_arm(void) {
 /* True once the query has run past its wall-clock budget. Sticky: after the
  * first trip every subsequent call returns true, so later loops short-circuit. */
 static bool cypher_deadline_exceeded(void) {
-    if (g_cypher_timed_out) {
+    if (g_cypher_timed_out || g_cypher_read_failed) {
         return true;
     }
     if (g_cypher_deadline_ms == 0) {
@@ -3308,6 +3329,40 @@ static bool cypher_deadline_exceeded(void) {
         return true;
     }
     return false;
+}
+
+/* A store read's result. OK: use it. NOT_FOUND: nothing there (an edge to a
+ * missing node). SCAN_LIMIT: a read of several round trips stopped at the
+ * deadline, so the query is out of time. Anything else: the graph could not
+ * be read (see g_cypher_read_failed). */
+static bool cypher_read_ok(int rc, cbm_store_t *store) {
+    if (rc == CBM_STORE_OK) {
+        return true;
+    }
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return false;
+    }
+    if (rc == CBM_STORE_SCAN_LIMIT) {
+        g_cypher_timed_out = true;
+        return false;
+    }
+    if (!g_cypher_read_failed) {
+        g_cypher_read_failed = true;
+        const char *why = store ? cbm_store_error(store) : NULL;
+        snprintf(g_cypher_scan_error, sizeof(g_cypher_scan_error), "%s",
+                 why && why[0] ? why : "unknown store error");
+        cbm_log_error("cypher.read_failed", "error", g_cypher_scan_error);
+    }
+    return false;
+}
+
+/* cypher_read_ok for an edge read: anything but OK leaves no edges. */
+static void cypher_edges_checked(int rc, cbm_store_t *store, cbm_edge_t **edges, int *count) {
+    if (!cypher_read_ok(rc, store)) {
+        cbm_store_free_edges(*edges, *count);
+        *edges = NULL;
+        *count = 0;
+    }
 }
 
 /* Test-only: force the execution budget (ms) for subsequent queries on this
@@ -3512,7 +3567,12 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
     for (char *tok = strtok_r(copy, "|", &save); tok; tok = strtok_r(NULL, "|", &save)) {
         cbm_node_t *part = NULL;
         int pc = 0;
-        cbm_store_find_nodes_by_label(store, project, tok, &part, &pc);
+        if (!cypher_read_ok(cbm_store_find_nodes_by_label(store, project, tok, &part, &pc),
+                            store)) {
+            cbm_store_free_nodes(part, pc);
+            part = NULL;
+            pc = 0;
+        }
         if (pc > 0 && part) {
             if (*out_count + pc > cap) {
                 cap = (*out_count + pc) * PAIR_LEN;
@@ -3531,9 +3591,17 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, cbm_node
     if (first->label && strchr(first->label, '|')) {
         scan_alternation_labels(store, project, first->label, out_nodes, out_count);
     } else if (first->label) {
-        cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count);
-    } else {
-        cbm_store_find_nodes(store, project, out_nodes, out_count);
+        if (!cypher_read_ok(
+                cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count),
+                store)) {
+            cbm_store_free_nodes(*out_nodes, *out_count);
+            *out_nodes = NULL;
+            *out_count = 0;
+        }
+    } else if (!cypher_read_ok(cbm_store_find_nodes(store, project, out_nodes, out_count), store)) {
+        cbm_store_free_nodes(*out_nodes, *out_count);
+        *out_nodes = NULL;
+        *out_count = 0;
     }
     /* Apply inline property filters — free rejected nodes' strings */
     if (first->prop_count > 0) {
@@ -3609,8 +3677,12 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
             continue; /* edge does not reach the already-bound terminal node */
         }
         cbm_node_t found = {0};
-        if (cbm_store_find_node_by_id(store, tid, &found) != CBM_STORE_OK) {
-            continue;
+        if (!cypher_read_ok(cbm_store_find_node_by_id(store, tid, &found), store)) {
+            node_fields_free(&found);
+            if (g_cypher_read_failed) {
+                return;
+            }
+            continue; /* an edge to a node that is not there */
         }
         if (target_node->label && !label_alt_matches(found.label, target_node->label)) {
             node_fields_free(&found);
@@ -3667,8 +3739,12 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
     int traversal_depth = probe_beyond_depth_cap ? depth_cap + SKIP_ONE : max_depth;
-    cbm_store_bfs_trail(store, src->id, dir, rel->types, rel->type_count, traversal_depth,
-                        CBM_PERCENT, &tr);
+    if (!cypher_read_ok(cbm_store_bfs_trail(store, src->id, dir, rel->types, rel->type_count,
+                                            traversal_depth, CBM_PERCENT, &tr),
+                        store)) {
+        cbm_store_traverse_free(&tr);
+        return;
+    }
     if (tr.truncated) {
         g_cypher_trail_truncated = 1;
     }
@@ -3721,11 +3797,13 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             cbm_edge_t *edges = NULL;
             int edge_count = 0;
             if (is_inbound) {
-                cbm_store_find_edges_by_target_type(store, src->id, rel->types[ti], &edges,
-                                                    &edge_count);
+                cypher_edges_checked(cbm_store_find_edges_by_target_type(
+                                         store, src->id, rel->types[ti], &edges, &edge_count),
+                                     store, &edges, &edge_count);
             } else {
-                cbm_store_find_edges_by_source_type(store, src->id, rel->types[ti], &edges,
-                                                    &edge_count);
+                cypher_edges_checked(cbm_store_find_edges_by_source_type(
+                                         store, src->id, rel->types[ti], &edges, &edge_count),
+                                     store, &edges, &edge_count);
             }
             process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
                           new_bindings, new_count, new_cap, match_count);
@@ -3735,8 +3813,9 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             for (int ti = 0; ti < rel->type_count; ti++) {
                 cbm_edge_t *edges = NULL;
                 int edge_count = 0;
-                cbm_store_find_edges_by_target_type(store, src->id, rel->types[ti], &edges,
-                                                    &edge_count);
+                cypher_edges_checked(cbm_store_find_edges_by_target_type(
+                                         store, src->id, rel->types[ti], &edges, &edge_count),
+                                     store, &edges, &edge_count);
                 process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
                               new_bindings, new_count, new_cap, match_count);
                 cbm_store_free_edges(edges, edge_count);
@@ -3746,9 +3825,11 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         cbm_edge_t *edges = NULL;
         int edge_count = 0;
         if (is_inbound) {
-            cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count);
+            cypher_edges_checked(cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count),
+                                 store, &edges, &edge_count);
         } else {
-            cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count);
+            cypher_edges_checked(cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count),
+                                 store, &edges, &edge_count);
         }
         process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
                       new_bindings, new_count, new_cap, match_count);
@@ -3756,7 +3837,8 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         if (is_any) {
             edges = NULL;
             edge_count = 0;
-            cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count);
+            cypher_edges_checked(cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count),
+                                 store, &edges, &edge_count);
             process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
                           new_bindings, new_count, new_cap, match_count);
             cbm_store_free_edges(edges, edge_count);
@@ -3771,10 +3853,8 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
 
 /* Prefetch the edges `rel` will read for bindings[from..to) (their `var`
  * node), in the direction(s) the expansion reads them. A hint only: results
- * never depend on it. When the remote store reports more edges than it
- * prefetches at once, walking them here would download a large share of the
- * graph: the query's budget is spent now, so the caller can answer it
- * another way (query_graph runs it natively in Neo4j). */
+ * never depend on it (a hub is left out and read in pages, under the
+ * execution budget, when the walk reaches it). */
 static void prefetch_rel_edges(cbm_store_t *store, const cbm_rel_pattern_t *rel,
                                binding_t *bindings, int from, int to, const char *var,
                                bool by_target, bool also_other_direction) {
@@ -3792,21 +3872,15 @@ static void prefetch_rel_edges(cbm_store_t *store, const cbm_rel_pattern_t *rel,
             ids[n++] = node->id;
         }
     }
-    bool too_large = false;
     if (n > 0) {
-        too_large = cbm_store_prefetch_edges(store, ids, n, by_target,
-                                             (const char *const *)rel->types,
-                                             rel->type_count) == CBM_STORE_SCAN_LIMIT;
-        if (!too_large && also_other_direction) {
-            too_large = cbm_store_prefetch_edges(store, ids, n, !by_target,
-                                                 (const char *const *)rel->types,
-                                                 rel->type_count) == CBM_STORE_SCAN_LIMIT;
+        (void)cbm_store_prefetch_edges(store, ids, n, by_target, (const char *const *)rel->types,
+                                       rel->type_count);
+        if (also_other_direction) {
+            (void)cbm_store_prefetch_edges(store, ids, n, !by_target,
+                                           (const char *const *)rel->types, rel->type_count);
         }
     }
     free(ids);
-    if (too_large) {
-        g_cypher_timed_out = true; /* sticky: every loop now stops */
-    }
 }
 
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
@@ -5568,33 +5642,39 @@ static void ret_sink_feed_agg(ret_sink_t *s, binding_t *bindings, int bind_count
     }
 }
 
+/* The result column name of one RETURN item (heap; NULL only for an item
+ * without a variable, as before). Shared with cbm_cypher_column_names. */
+static char *return_item_column_name(const cbm_return_item_t *item) {
+    char buf[CBM_SZ_128];
+    if (item->alias) {
+        return heap_strdup(item->alias);
+    }
+    if (item->func) {
+        snprintf(buf, sizeof(buf), "%s(%s)", item->func,
+                 item->variable ? item->variable : "(null)"); /* as printf rendered NULL */
+        return heap_strdup(buf);
+    }
+    if (item->kase) {
+        return heap_strdup("CASE");
+    }
+    if (item->property) {
+        snprintf(buf, sizeof(buf), "%s.%s", item->variable ? item->variable : "(null)",
+                 item->property);
+        return heap_strdup(buf);
+    }
+    return heap_strdup(item->variable);
+}
+
 /* Build RETURN column names from items */
 static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret) {
     const char *col_names[CBM_SZ_32];
-    for (int i = 0; i < ret->count && i < CBM_SZ_32; i++) {
-        cbm_return_item_t *item = &ret->items[i];
-        if (item->alias) {
-            col_names[i] = item->alias;
-        } else if (item->func) {
-            char buf[CBM_SZ_128];
-            snprintf(buf, sizeof(buf), "%s(%s)", item->func, item->variable);
-            col_names[i] = heap_strdup(buf);
-        } else if (item->kase) {
-            col_names[i] = "CASE";
-        } else if (item->property) {
-            char buf[CBM_SZ_128];
-            snprintf(buf, sizeof(buf), "%s.%s", item->variable, item->property);
-            col_names[i] = heap_strdup(buf);
-        } else {
-            col_names[i] = item->variable;
-        }
+    int n = ret->count < CBM_SZ_32 ? ret->count : CBM_SZ_32;
+    for (int i = 0; i < n; i++) {
+        col_names[i] = return_item_column_name(&ret->items[i]);
     }
-    rb_set_columns(rb, col_names, ret->count);
-    for (int i = 0; i < ret->count && i < CBM_SZ_32; i++) {
-        cbm_return_item_t *item = &ret->items[i];
-        if (!item->alias && (item->func || (!item->kase && item->property))) {
-            safe_str_free(&col_names[i]);
-        }
+    rb_set_columns(rb, col_names, n);
+    for (int i = 0; i < n; i++) {
+        free((void *)col_names[i]);
     }
 }
 
@@ -5619,6 +5699,12 @@ static void ret_sink_feed_rows(ret_sink_t *s, binding_t *bindings, int bind_coun
         }
         if (!rb_add_row_capped(s->rb, &s->seen, vals, s->cap)) {
             g_cypher_truncated = g_cypher_truncated || s->cap_is_engine_budget;
+            /* Only the engine's own 100k ceiling: a caller's max_rows is a page
+             * budget whose capped rows are returned as such (truncated). */
+            if (s->cap_is_engine_budget && s->max_rows >= CYPHER_RESULT_CEILING && s->ret &&
+                s->ret->order_key_count > 0) {
+                g_cypher_ordered_cut = true;
+            }
             s->done = true;
         }
     }
@@ -5946,19 +6032,18 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
             for (int ti = 0; ti < (rel->type_count > 0 ? rel->type_count : 1); ti++) {
                 cbm_edge_t *edges = NULL;
                 int edge_count = 0;
+                int erc;
                 if (rel->type_count > 0) {
-                    if (scan_targets) {
-                        cbm_store_find_edges_by_target_type(store, term->id, rel->types[ti], &edges,
-                                                            &edge_count);
-                    } else {
-                        cbm_store_find_edges_by_source_type(store, term->id, rel->types[ti], &edges,
-                                                            &edge_count);
-                    }
-                } else if (scan_targets) {
-                    cbm_store_find_edges_by_target(store, term->id, &edges, &edge_count);
+                    erc = scan_targets ? cbm_store_find_edges_by_target_type(
+                                             store, term->id, rel->types[ti], &edges, &edge_count)
+                                       : cbm_store_find_edges_by_source_type(
+                                             store, term->id, rel->types[ti], &edges, &edge_count);
                 } else {
-                    cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
+                    erc = scan_targets
+                              ? cbm_store_find_edges_by_target(store, term->id, &edges, &edge_count)
+                              : cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
                 }
+                cypher_edges_checked(erc, store, &edges, &edge_count);
                 for (int ei = 0; ei < edge_count; ei++) {
                     if ((ei & CYPHER_DEADLINE_CHECK_MASK) == 0 && ei > 0 &&
                         cypher_deadline_exceeded()) {
@@ -5966,8 +6051,12 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                     }
                     int64_t sid = scan_targets ? edges[ei].source_id : edges[ei].target_id;
                     cbm_node_t found = {0};
-                    if (cbm_store_find_node_by_id(store, sid, &found) != CBM_STORE_OK) {
-                        continue;
+                    if (!cypher_read_ok(cbm_store_find_node_by_id(store, sid, &found), store)) {
+                        node_fields_free(&found);
+                        if (g_cypher_read_failed) {
+                            break;
+                        }
+                        continue; /* an edge to a node that is not there */
                     }
                     if (start_node->label && !label_alt_matches(found.label, start_node->label)) {
                         node_fields_free(&found);
@@ -6463,7 +6552,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     int start_index = 0;
     do {
         rc = execute_chunk(store, q, project, max_rows, &src, chunk, &start_index, &sink);
-    } while (rc == 0 && !src.done && !g_cypher_timed_out);
+    } while (rc == 0 && !src.done && !g_cypher_timed_out && !g_cypher_read_failed);
     start_source_close(&src);
 
     if (rc == 0) {
@@ -6737,7 +6826,8 @@ static int cypher_execute_impl(cbm_store_t *store, const char *query, const char
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     int rc = cypher_execute_impl(store, query, project, max_rows, out);
-    out->timed_out = rc < 0 && g_cypher_timed_out;
+    out->timed_out = rc < 0 && g_cypher_timed_out && !g_cypher_read_failed;
+    cbm_store_set_read_deadline(store, 0);
     cbm_store_prefetch_clear(store); /* release this query's prefetched edges */
     return rc;
 }
@@ -6749,8 +6839,11 @@ static int cypher_execute_impl(cbm_store_t *store, const char *query, const char
     g_cypher_trail_truncated = 0;
     g_cypher_truncated = false;
     g_cypher_regex_refused = false;
+    g_cypher_ordered_cut = false;
     g_cypher_scan_error[0] = '\0';
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
+    /* Multi-page remote reads (a hub's edges) stop between pages at it. */
+    cbm_store_set_read_deadline(store, g_cypher_deadline_ms);
     /* max_rows sizes the initial binding array: non-positive means the
      * ceiling, and nothing above the ceiling is ever materialized anyway. */
     if (max_rows <= 0 || max_rows > CYPHER_RESULT_CEILING) {
@@ -6808,6 +6901,14 @@ static int cypher_execute_impl(cbm_store_t *store, const char *query, const char
         rb_apply_distinct(&rb);
     }
 
+    /* A store read failed: the rows are incomplete. */
+    if (g_cypher_read_failed) {
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error = cypher_abort_error();
+        return CBM_NOT_FOUND;
+    }
+
     /* #601: abort a runaway query that blew the wall-clock budget before it can
      * return a misleading partial result. Checked before the row ceiling. */
     if (g_cypher_timed_out) {
@@ -6821,14 +6922,29 @@ static int cypher_execute_impl(cbm_store_t *store, const char *query, const char
         return CBM_NOT_FOUND;
     }
 
-    /* Check ceiling */
-    if (rb.row_count >= CYPHER_RESULT_CEILING) {
-        g_cypher_truncated = true;
+    /* The row ceiling. Rows past it are not materialized: the result is the
+     * first CYPHER_RESULT_CEILING rows, marked truncated (as Neo4j's native
+     * answer is), unless ORDER BY still had to rank rows the cap dropped --
+     * then the kept rows are not the first ones in order, and the query
+     * fails (query_graph answers it in Neo4j where it can). */
+    if (g_cypher_ordered_cut) {
         rb_free(&rb);
         cbm_query_free(q);
         out->truncated = true;
-        out->error = heap_strdup("result exceeded 100k rows — use narrower filters or add LIMIT");
+        out->row_ceiling = true;
+        out->error = heap_strdup("ORDER BY would rank more than 100k rows — add a WHERE filter, or "
+                                 "LIMIT the rows before ordering them");
         return CBM_NOT_FOUND;
+    }
+    if (rb.row_count > CYPHER_RESULT_CEILING) { /* a UNION concatenates capped parts */
+        for (int i = CYPHER_RESULT_CEILING; i < rb.row_count; i++) {
+            for (int c = 0; c < rb.col_count; c++) {
+                free((void *)rb.rows[i][c]);
+            }
+            free((void *)rb.rows[i]);
+        }
+        rb.row_count = CYPHER_RESULT_CEILING;
+        g_cypher_truncated = true;
     }
 
     out->columns = rb.columns;
@@ -6890,6 +7006,34 @@ void cbm_cypher_result_free(cbm_cypher_result_t *r) {
     free(r->rows);
     free(r->error);
     memset(r, 0, sizeof(*r));
+}
+
+int cbm_cypher_column_names(const char *query, char ***names, int *count) {
+    *names = NULL;
+    *count = 0;
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    if (!query || cbm_cypher_parse(query, &q, &err) != 0 || !q) {
+        free(err);
+        cbm_query_free(q);
+        return 0;
+    }
+    free(err);
+    int known = 0;
+    const cbm_return_clause_t *ret = q->ret;
+    if (ret && !ret->star && ret->count > 0 && ret->count <= CBM_SZ_32) {
+        char **out = calloc((size_t)ret->count, sizeof(char *));
+        if (out) {
+            for (int i = 0; i < ret->count; i++) {
+                out[i] = return_item_column_name(&ret->items[i]);
+            }
+            *names = out;
+            *count = ret->count;
+            known = 1;
+        }
+    }
+    cbm_query_free(q);
+    return known;
 }
 
 int cbm_cypher_start_scan(const char *query, char *label, size_t label_sz, bool *expands) {

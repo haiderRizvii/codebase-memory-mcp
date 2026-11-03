@@ -55,11 +55,13 @@ int cbm_neo4j_http_set_extra_headers(cbm_neo4j_http_t *h, const char *headers);
  * a server-side time limit the requests carry. */
 void cbm_neo4j_http_set_max_wait(cbm_neo4j_http_t *h, int max_wait_ms);
 
+#ifdef CBM_ENABLE_TEST_SEAMS
 /* Tests: decode a chunked body that arrives `step` bytes at a time, as the
  * socket reader does. 0 with *out (malloc'd, decoded bytes first), *consumed
  * (raw bytes used) and *buffered (raw bytes read so far; those after
  * *consumed are the next response's), 1 when truncated, -1 when malformed. */
 int cbm_neo4j_test_dechunk(const char *raw, size_t raw_len, size_t step, char **out,
                            size_t *out_len, size_t *consumed, size_t *buffered);
+#endif
 
 #endif /* CBM_NEO4J_HTTP_H */

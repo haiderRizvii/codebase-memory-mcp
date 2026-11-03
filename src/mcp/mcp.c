@@ -5697,11 +5697,18 @@ enum {
     QUERY_GRAPH_CURSOR_DIGEST_HEX_LEN = 32
 };
 
+/* Which path answered a Neo4j-backed query: the in-process engine ('e') or
+ * Neo4j natively ('n'); 0 = not recorded (local projects, q1 tokens). A
+ * cursor continues on the path of its first page: the two paths can render
+ * the same rows differently, which would read as a changed result. */
+enum { QG_PATH_NONE = 0, QG_PATH_ENGINE = 'e', QG_PATH_NATIVE = 'n' };
+
 typedef struct {
     char generation[QUERY_GRAPH_GENERATION_CAP];
     uint64_t params_hash;
     char result_digest[QUERY_GRAPH_CURSOR_DIGEST_HEX_LEN + 1];
     int offset;
+    char path; /* QG_PATH_*; set only by q2 tokens */
 } query_graph_cursor_t;
 
 typedef struct {
@@ -5709,6 +5716,7 @@ typedef struct {
     uint64_t params_hash;
     const char *result_digest;
     bool can_mint;
+    char path; /* QG_PATH_*: q2 tokens record it */
 } query_graph_cursor_context_t;
 
 static void query_graph_sha_u64(cbm_sha256_ctx *sha, uint64_t value) {
@@ -5792,6 +5800,9 @@ static void query_graph_cursor_seal(const query_graph_cursor_t *cursor, char out
     query_graph_sha_u64(&sha, cursor->params_hash);
     query_graph_sha_field(&sha, cursor->result_digest);
     query_graph_sha_u64(&sha, (uint64_t)cursor->offset);
+    if (cursor->path) { /* q2: the path is sealed too; q1 seals stay as they were */
+        query_graph_sha_u64(&sha, (uint64_t)(unsigned char)cursor->path);
+    }
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     cbm_sha256_final(&sha, digest);
     char full_hex[CBM_SHA256_HEX_LEN + 1];
@@ -5806,15 +5817,21 @@ static bool query_graph_cursor_encode(const query_graph_cursor_context_t *contex
         offset <= 0) {
         return false;
     }
-    query_graph_cursor_t cursor = {.params_hash = context->params_hash, .offset = offset};
+    query_graph_cursor_t cursor = {
+        .params_hash = context->params_hash, .offset = offset, .path = context->path};
     snprintf(cursor.generation, sizeof(cursor.generation), "%s", context->generation);
     snprintf(cursor.result_digest, sizeof(cursor.result_digest), "%.*s",
              QUERY_GRAPH_CURSOR_DIGEST_HEX_LEN, context->result_digest);
     char seal[17];
     query_graph_cursor_seal(&cursor, seal);
     int written =
-        snprintf(out, QUERY_GRAPH_CURSOR_TOKEN_CAP, "q1.%s.%016llx.%s.%d.%s", cursor.generation,
-                 (unsigned long long)cursor.params_hash, cursor.result_digest, cursor.offset, seal);
+        cursor.path
+            ? snprintf(out, QUERY_GRAPH_CURSOR_TOKEN_CAP, "q2.%s.%016llx.%s.%d.%c.%s",
+                       cursor.generation, (unsigned long long)cursor.params_hash,
+                       cursor.result_digest, cursor.offset, cursor.path, seal)
+            : snprintf(out, QUERY_GRAPH_CURSOR_TOKEN_CAP, "q1.%s.%016llx.%s.%d.%s",
+                       cursor.generation, (unsigned long long)cursor.params_hash,
+                       cursor.result_digest, cursor.offset, seal);
     return written > 0 && written < QUERY_GRAPH_CURSOR_TOKEN_CAP;
 }
 
@@ -5840,7 +5857,8 @@ static const char *query_graph_cursor_decode(const char *token, const char *curr
         "invalid_cursor: unrecognized or modified token — re-run the original query without "
         "'cursor'";
     memset(out, 0, sizeof(*out));
-    if (!token || strncmp(token, "q1.", 3) != 0) {
+    bool q2 = token && strncmp(token, "q2.", 3) == 0;
+    if (!token || (!q2 && strncmp(token, "q1.", 3) != 0)) {
         return invalid;
     }
     const char *generation_start = token + 3;
@@ -5884,6 +5902,14 @@ static const char *query_graph_cursor_decode(const char *token, const char *curr
     out->offset = (int)parsed_offset;
 
     const char *seal_start = offset_end + 1;
+    if (q2) {
+        if ((seal_start[0] != QG_PATH_ENGINE && seal_start[0] != QG_PATH_NATIVE) ||
+            seal_start[1] != '.') {
+            return invalid;
+        }
+        out->path = seal_start[0];
+        seal_start += 2;
+    }
     const char *seal_end = token + strlen(token);
     if (!query_graph_hex_span(seal_start, seal_end, 16)) {
         return invalid;
@@ -6150,7 +6176,9 @@ static char *query_graph_budget_floor_text(const cbm_cypher_result_t *result, in
 }
 
 /* Run query in Neo4j itself, every node pattern scoped to this project's
- * graph. 0 and *out filled, or -1 with why[] naming the reason. */
+ * graph, rendered like the engine renders it: a missing value is "" and the
+ * columns carry the engine's names ("COUNT(d)", not Neo4j's "count(d)").
+ * 0 and *out filled, or -1 with why[] naming the reason. */
 static int query_graph_native_run(const char *project, const char *query, cbm_cypher_result_t *out,
                                   char *why, size_t why_sz) {
     why[0] = '\0';
@@ -6160,7 +6188,7 @@ static int query_graph_native_run(const char *project, const char *query, cbm_cy
     }
     char db_path[CBM_SZ_1K];
     project_db_path(project, db_path, sizeof(db_path));
-    int rc = cbm_neo4j_native_query(db_path, project, scoped, 0, out);
+    int rc = cbm_neo4j_native_query_ex(db_path, project, scoped, 0, true, out);
     free(scoped);
     if (rc < 0) {
         (void)snprintf(why, why_sz, "Neo4j rejected it: %.200s",
@@ -6168,19 +6196,40 @@ static int query_graph_native_run(const char *project, const char *query, cbm_cy
         cbm_cypher_result_free(out);
         return -1;
     }
+    char **names = NULL;
+    int name_count = 0;
+    if (cbm_cypher_column_names(query, &names, &name_count) && name_count == out->col_count) {
+        for (int i = 0; i < name_count; i++) {
+            if (names[i]) {
+                free((void *)out->columns[i]);
+                out->columns[i] = names[i];
+                names[i] = NULL;
+            }
+        }
+    }
+    for (int i = 0; i < name_count; i++) {
+        free(names[i]);
+    }
+    free(names);
     return 0;
 }
 
-/* The warning a natively answered result carries: why Neo4j answered, and
- * how its values differ from the engine's. */
-static void query_graph_native_note(cbm_cypher_result_t *result, const char *reason) {
+/* The warning a natively answered result carries. One fixed text whatever
+ * made Neo4j answer (prediction, an earlier fallback, the budget running
+ * out): the warning is part of the cursor's materialization digest, so a
+ * second page answered for another reason must read the same. The reason is
+ * logged instead. */
+static void query_graph_native_note(cbm_cypher_result_t *result, const char *project,
+                                    const char *reason) {
+    cbm_log_info("query_graph.native", "project", project ? project : "", "reason",
+                 reason ? reason : "");
     char note[CBM_SZ_1K];
     (void)snprintf(note, sizeof(note),
-                   "answered natively by Neo4j: %s. Values are "
-                   "Neo4j-typed (numbers compare as numbers, a missing property is null) and "
-                   "unaliased columns are named by Neo4j (count(n), not COUNT(n)): alias "
-                   "them (AS name) for stable names%s%s",
-                   reason, result->warning ? "; " : "", result->warning ? result->warning : "");
+                   "answered natively by Neo4j: the in-process engine cannot answer this query "
+                   "within its %d s budget on this Neo4j-backed graph. Values are Neo4j-typed "
+                   "(numbers compare as numbers; nulls inside lists and maps stay null)%s%s",
+                   MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000, result->warning ? "; " : "",
+                   result->warning ? result->warning : "");
     free(result->warning);
     result->warning = heap_strdup(note);
 }
@@ -6418,6 +6467,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     }
 
     cbm_cypher_result_t result = {0};
+    char answered_path = QG_PATH_NONE; /* recorded in cursors of Neo4j-backed answers */
     /* `max_rows` is a presentation budget, never an evaluation budget.
      * Executing at visible_limit+1 corrupts ORDER BY, DISTINCT, aggregation,
      * and SKIP semantics before serialization gets a chance to trim rows.
@@ -6443,46 +6493,77 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         uint64_t memo_key = qg_native_memo_key(effective_project, query, generation);
         char reason[CBM_SZ_512] = "";
         char native_why[CBM_SZ_256] = "";
-        bool predicted = can_fall_back &&
-                         qg_predict_native(srv, store, effective_project, generation, query,
-                                           memo_key, reason, sizeof(reason));
+        /* A cursor page is recomputed on the path that answered page 1. */
+        char forced = cursor_arg ? cursor.path : QG_PATH_NONE;
+        bool predicted;
+        if (forced == QG_PATH_NATIVE) {
+            predicted = true;
+            (void)snprintf(reason, sizeof(reason), "a cursor page of a native answer");
+        } else if (forced == QG_PATH_ENGINE) {
+            predicted = false;
+        } else {
+            predicted = can_fall_back &&
+                        qg_predict_native(srv, store, effective_project, generation, query,
+                                          memo_key, reason, sizeof(reason));
+        }
         rc = -1;
         if (predicted) {
             rc = query_graph_native_run(effective_project, query, &result, native_why,
                                         sizeof(native_why));
             if (rc == 0) {
-                query_graph_native_note(&result, reason);
+                query_graph_native_note(&result, effective_project, reason);
                 cbm_store_note_remote_queries(store, 1);
+                answered_path = QG_PATH_NATIVE;
+            } else if (forced == QG_PATH_NATIVE) {
+                char msg[CBM_SZ_512];
+                (void)snprintf(msg, sizeof(msg),
+                               "cursor_page_failed: Neo4j could not recompute this page (%s) — "
+                               "re-run the query without 'cursor'",
+                               native_why[0] ? native_why : "query failed");
+                memset(&result, 0, sizeof(result));
+                result.error = heap_strdup(msg);
             }
         }
-        if (rc < 0) {
+        if (rc < 0 && forced != QG_PATH_NATIVE) {
             /* No prediction, or Neo4j refused the query: the engine answers,
-             * with Neo4j as the fallback if it runs out of budget. */
+             * with Neo4j as the fallback if it runs out of budget. A cursor
+             * page of an engine answer gets the full budget and no fallback. */
             memset(&result, 0, sizeof(result));
-            if (can_fall_back) {
+            bool short_budget = can_fall_back && forced != QG_PATH_ENGINE;
+            if (short_budget) {
                 cbm_cypher_set_budget_ms(MCP_QUERY_ENGINE_REMOTE_BUDGET_MS);
             }
             rc = cbm_cypher_execute(store, query, cypher_project, 0, &result);
             cbm_cypher_set_budget_ms(0);
-            if (can_fall_back && rc < 0 && result.timed_out) {
+            if (rc == 0) {
+                answered_path = QG_PATH_ENGINE;
+            } else if (forced == QG_PATH_ENGINE && result.timed_out) {
+                free(result.error);
+                result.error = heap_strdup(
+                    "cursor_page_timeout: this page could not be recomputed within the execution "
+                    "time limit — re-run the query without 'cursor'");
+            } else if (short_budget && (result.timed_out || result.row_ceiling)) {
+                /* Out of budget, or more rows to rank than the engine keeps:
+                 * Neo4j ranks them all. */
+                bool ceiling = result.row_ceiling;
                 if (predicted) {
-                    query_graph_native_failed(&result, native_why); /* already tried */
+                    if (!ceiling) {
+                        query_graph_native_failed(&result, native_why); /* already tried */
+                    }
                 } else {
                     cbm_cypher_result_t nres = {0};
                     if (query_graph_native_run(effective_project, query, &nres, native_why,
                                                sizeof(native_why)) == 0) {
                         cbm_cypher_result_free(&result);
                         result = nres;
-                        char why_note[CBM_SZ_256];
-                        (void)snprintf(why_note, sizeof(why_note),
-                                       "in the in-process engine this query would read too much "
-                                       "of the Neo4j-backed graph over HTTP (budget %d s)",
-                                       MCP_QUERY_ENGINE_REMOTE_BUDGET_MS / 1000);
-                        query_graph_native_note(&result, why_note);
+                        query_graph_native_note(&result, effective_project,
+                                                ceiling ? "more rows to rank than the engine keeps"
+                                                        : "the engine ran out of its budget");
                         cbm_store_note_remote_queries(store, 1);
                         qg_native_memo_add(srv, memo_key);
+                        answered_path = QG_PATH_NATIVE;
                         rc = 0;
-                    } else {
+                    } else if (!ceiling) {
                         query_graph_native_failed(&result, native_why);
                     }
                 }
@@ -6517,6 +6598,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return resp;
     }
     query_graph_cursor_context_t cursor_context = {
+        .path = answered_path,
         .generation = generation,
         .params_hash = params_hash,
         .result_digest = result_digest,
@@ -16173,50 +16255,69 @@ static bool search_window_load_nodes(search_window_t *w, cbm_store_t *store, con
     if (!store || w->n == 0) {
         return true;
     }
+    /* Each distinct file is requested once; window entries of the same file
+     * (a file whose matches arrive non-adjacently) share its slice -- the
+     * classification only reads it. */
     const char **want = malloc((size_t)w->n * sizeof(char *));
-    int *want_entry = malloc((size_t)w->n * sizeof(int));
-    if (!want || !want_entry) {
+    int *slot = malloc((size_t)w->n * sizeof(int));
+    int *want_first = malloc((size_t)w->n * sizeof(int));
+    int *want_count = malloc((size_t)w->n * sizeof(int));
+    if (!want || !slot || !want_first || !want_count) {
         free(want);
-        free(want_entry);
+        free(slot);
+        free(want_first);
+        free(want_count);
         return false;
     }
     int nw = 0;
     for (int i = 0; i < w->n; i++) {
         w->first[i] = 0;
         w->count[i] = 0;
-        if (w->inside[i]) {
-            want[nw] = w->files[i];
-            want_entry[nw] = i;
-            nw++;
+        slot[i] = -1;
+        if (!w->inside[i]) {
+            continue;
         }
+        int k = nw > 0 && strcmp(want[nw - 1], w->files[i]) == 0 ? nw - 1 : -1;
+        for (int j = 0; k < 0 && j < nw - 1; j++) {
+            if (strcmp(want[j], w->files[i]) == 0) {
+                k = j;
+            }
+        }
+        if (k < 0) {
+            k = nw;
+            want[nw++] = w->files[i];
+        }
+        slot[i] = k;
     }
     cbm_node_t *nodes = NULL;
     int node_count = 0;
-    if (nw > 0 &&
-        cbm_store_find_nodes_by_files(store, project, want, nw, &nodes, &node_count) !=
-            CBM_STORE_OK) {
-        free(want);
-        free(want_entry);
-        return false;
-    }
-    if (nw > 0) {
+    bool ok = nw == 0 || cbm_store_find_nodes_by_files(store, project, want, nw, &nodes,
+                                                       &node_count) == CBM_STORE_OK;
+    if (ok && nw > 0) {
         /* grouped by file in request order, so one forward walk slices them */
         int at = 0;
         for (int k = 0; k < nw; k++) {
-            int e = want_entry[k];
-            w->first[e] = at;
+            want_first[k] = at;
             while (at < node_count && nodes[at].file_path &&
-                   strcmp(nodes[at].file_path, w->files[e]) == 0) {
+                   strcmp(nodes[at].file_path, want[k]) == 0) {
                 at++;
             }
-            w->count[e] = at - w->first[e];
+            want_count[k] = at - want_first[k];
+        }
+        for (int i = 0; i < w->n; i++) {
+            if (slot[i] >= 0) {
+                w->first[i] = want_first[slot[i]];
+                w->count[i] = want_count[slot[i]];
+            }
         }
         w->nodes = nodes;
         w->node_count = node_count;
     }
     free(want);
-    free(want_entry);
-    return true;
+    free(slot);
+    free(want_first);
+    free(want_count);
+    return ok;
 }
 
 static bool scan_and_classify_grep_matches(
@@ -18836,34 +18937,39 @@ static bool detect_walk_run(cbm_store_t *store, const char *project,
         ok = ok && cbm_store_find_nodes_by_ids(store, ids, id_count, &found, &found_count) ==
                        CBM_STORE_OK;
     }
+    /* moved_to[k]: the row found[k] was moved into, -1 while it is still here.
+     * Walk hits are distinct ids (the walk's reached-set), so a row moves out
+     * once; should one repeat, it is copied from that row instead of reading
+     * the emptied slot. */
+    int *moved_to = ok && found_count > 0 ? malloc((size_t)found_count * sizeof(int)) : NULL;
+    ok = ok && (found_count == 0 || moved_to);
+    for (int k = 0; ok && k < found_count; k++) {
+        moved_to[k] = -1;
+    }
     for (int i = 0; ok && i < total; i++) {
         if (hits[i].hop == 0) {
             continue;
         }
-        int lo = 0;
-        int hi = found_count - SKIP_ONE;
-        int at = -1;
-        while (lo <= hi) {
-            int mid = lo + (hi - lo) / 2;
-            if (found[mid].id == hits[i].id) {
-                at = mid;
-                break;
-            }
-            if (found[mid].id < hits[i].id) {
-                lo = mid + SKIP_ONE;
-            } else {
-                hi = mid - SKIP_ONE;
-            }
-        }
-        ok = at >= 0; /* a reached node the store cannot read fails the walk, as before */
+        cbm_node_t key = {.id = hits[i].id};
+        const cbm_node_t *hit =
+            found_count > 0
+                ? bsearch(&key, found, (size_t)found_count, sizeof(*found), cbm_store_node_cmp_id)
+                : NULL;
+        ok = hit != NULL; /* a reached node the store cannot read fails the walk, as before */
         if (ok) {
-            /* walk hits are distinct ids, so each found row moves out once */
-            rows[n].node = found[at];
-            memset(&found[at], 0, sizeof(found[at]));
-            found[at].id = hits[i].id; /* keep the array sorted for later searches */
+            int at = (int)(hit - found);
+            if (moved_to[at] >= 0) {
+                copy_node(&rows[moved_to[at]].node, &rows[n].node);
+            } else {
+                rows[n].node = found[at];
+                memset(&found[at], 0, sizeof(found[at]));
+                found[at].id = hits[i].id; /* keep the array sorted for later searches */
+                moved_to[at] = n;
+            }
             rows[n++].hop = hits[i].hop;
         }
     }
+    free(moved_to);
     free(ids);
     cbm_store_free_nodes(found, found_count);
     impact->visited = rows;
@@ -21415,6 +21521,9 @@ static char *mcp_report_graph_backend(cbm_mcp_server_t *srv, const char *tool_na
     if (!srv->store || !cbm_store_is_remote(srv->store)) {
         return result;
     }
+    /* Edges and far-end nodes cached for this request (a hub's 200k callers)
+     * must not stay in memory with the store between requests. */
+    cbm_store_prefetch_clear(srv->store);
     cbm_store_backend_usage_t usage;
     cbm_store_backend_usage(srv->store, &usage);
     const char *served_by = cbm_mcp_graph_served_by(usage.remote_queries, usage.local_reads);
