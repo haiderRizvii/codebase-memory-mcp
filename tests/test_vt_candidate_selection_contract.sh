@@ -434,7 +434,7 @@ def remove_unix_executable_mode(path: pathlib.Path) -> None:
         entries = [(info, handle.read(info)) for info in handle.infolist()]
     with zipfile.ZipFile(archive, "w") as handle:
         for info, payload in entries:
-            if info.filename == "server/codebase-memory-neo4j":
+            if info.filename == "server/codebase-memory-mcp-neo4j":
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | 0o644) << 16
             handle.writestr(info, payload)

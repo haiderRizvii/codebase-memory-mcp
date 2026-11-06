@@ -282,9 +282,10 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime
         bootstrap_runtime_parent_resolve(runtime_parent, override_parent, sizeof(override_parent));
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (!parent && g_bootstrap_default_runtime_forbidden) {
-        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: test run refused the default daemon runtime "
-                              "directory (no explicit parent and CBM_NEO4J_RUNTIME_DIR unset): the "
-                              "developer's live daemon listens there\n");
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp-neo4j: test run refused the default daemon runtime "
+                      "directory (no explicit parent and CBM_NEO4J_RUNTIME_DIR unset): the "
+                      "developer's live daemon listens there\n");
         return NULL;
     }
 #endif
@@ -650,13 +651,14 @@ static cbm_daemon_bootstrap_status_t bootstrap_finish_probe(
     result->client = NULL;
     if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_CONFLICT) {
         result->status = CBM_DAEMON_BOOTSTRAP_CONFLICT;
-        (void)snprintf(result->message, sizeof(result->message), "%s",
-                       connect_result && connect_result->message[0]
-                           ? connect_result->message
-                           : "CBM could not start because a conflicting CBM process is active; "
-                             "close all CBM sessions and commands, then retry. If a permanent "
-                             "daemon from another build is running, `codebase-memory-mcp-neo4j daemon "
-                             "stop` retires it");
+        (void)snprintf(
+            result->message, sizeof(result->message), "%s",
+            connect_result && connect_result->message[0]
+                ? connect_result->message
+                : "CBM could not start because a conflicting CBM process is active; "
+                  "close all CBM sessions and commands, then retry. If a permanent "
+                  "daemon from another build is running, `codebase-memory-mcp-neo4j daemon "
+                  "stop` retires it");
         if (ops->visible_diagnostic) {
             ops->visible_diagnostic(ops->context, result->message);
         }
@@ -1383,7 +1385,8 @@ static void bootstrap_production_diagnostic(void *context, const char *message) 
 #else
     (void)production;
 #endif
-    (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s\n", message ? message : "daemon startup failed");
+    (void)fprintf(stderr, "codebase-memory-mcp-neo4j: %s\n",
+                  message ? message : "daemon startup failed");
     (void)fflush(stderr);
 }
 

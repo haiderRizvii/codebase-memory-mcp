@@ -1111,7 +1111,7 @@ static int jl_match_openhands_entry(const char *document,
                                     char **captured) {
     static const char *const path[] = {"mcp_config"};
     return cbm_json_like_match_object_entry(document, strlen(document), path, 1U,
-                                            "codebase-memory-mcp-neo4j", fields, field_count, captured);
+                                            "codebase-memory-neo4j", fields, field_count, captured);
 }
 
 TEST(config_json_like_match_object_entry_literal_shape_issue1826) {

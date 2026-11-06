@@ -1047,7 +1047,8 @@ static void application_tmp_unlock(void) {
 
 static bool application_cache_dir(char out[APPLICATION_PATH_CAP]) {
     char configured[APPLICATION_PATH_CAP] = {0};
-    if (cbm_safe_getenv("CBM_NEO4J_CACHE_DIR", configured, sizeof(configured), NULL) && configured[0]) {
+    if (cbm_safe_getenv("CBM_NEO4J_CACHE_DIR", configured, sizeof(configured), NULL) &&
+        configured[0]) {
         int written = snprintf(out, APPLICATION_PATH_CAP, "%s", configured);
         if (written <= 0 || written >= APPLICATION_PATH_CAP) {
             return false;
@@ -2966,10 +2967,10 @@ static bool application_async_host_missing(cbm_daemon_application_session_t *ses
  * cancelling, nor this session closing cancels the job: only daemon shutdown
  * (or the final live session of a non-permanent generation) does. Never
  * queues behind the physical job limit: a full daemon answers busy. */
-#define APPLICATION_ASYNC_NEEDS_HOST                                                              \
-    "async indexing needs a daemon that outlives this command: this one-shot call is the only "   \
-    "client of a temporary daemon, which stops (cancelling the job) when the command exits. Run " \
-    "`codebase-memory-mcp-neo4j daemon start` (or keep an MCP session open), then retry; or call "      \
+#define APPLICATION_ASYNC_NEEDS_HOST                                                               \
+    "async indexing needs a daemon that outlives this command: this one-shot call is the only "    \
+    "client of a temporary daemon, which stops (cancelling the job) when the command exits. Run "  \
+    "`codebase-memory-mcp-neo4j daemon start` (or keep an MCP session open), then retry; or call " \
     "without async"
 
 static char *application_index_start_async(cbm_daemon_application_session_t *session,

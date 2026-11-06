@@ -3051,11 +3051,12 @@ bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active
         "config).";
     int written;
     if (!active) {
-        written = snprintf(out, out_size,
-                           "Run `codebase-memory-mcp-neo4j daemon status` to see the active daemon and "
-                           "the sessions using it. %s `codebase-memory-mcp-neo4j daemon stop` retires "
-                           "the daemon once no session uses it.",
-                           install_hint);
+        written =
+            snprintf(out, out_size,
+                     "Run `codebase-memory-mcp-neo4j daemon status` to see the active daemon and "
+                     "the sessions using it. %s `codebase-memory-mcp-neo4j daemon stop` retires "
+                     "the daemon once no session uses it.",
+                     install_hint);
     } else {
         char sessions[160];
         if (!remedy_sessions_format(active, sessions, sizeof(sessions))) {
@@ -3063,12 +3064,13 @@ bool cbm_daemon_conflict_remedy_format(const cbm_daemon_runtime_status_t *active
         }
         const char *lifetime =
             active->permanent ? "permanent" : "session-managed, exits when its last session closes";
-        written = snprintf(out, out_size,
-                           "Active daemon: pid %lu, version %s, %s%s%s. %s "
-                           "`codebase-memory-mcp-neo4j daemon stop` retires the daemon once no session "
-                           "uses it.",
-                           (unsigned long)active->daemon_pid, active->semantic_version, lifetime,
-                           active->stopping ? ", already stopping" : "", sessions, install_hint);
+        written =
+            snprintf(out, out_size,
+                     "Active daemon: pid %lu, version %s, %s%s%s. %s "
+                     "`codebase-memory-mcp-neo4j daemon stop` retires the daemon once no session "
+                     "uses it.",
+                     (unsigned long)active->daemon_pid, active->semantic_version, lifetime,
+                     active->stopping ? ", already stopping" : "", sessions, install_hint);
     }
     if (written < 0 || (size_t)written >= out_size) {
         out[0] = '\0';

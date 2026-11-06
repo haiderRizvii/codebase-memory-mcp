@@ -221,7 +221,8 @@ char *cbm_render_graph_prompt(cbm_graph_tier_t tier, cbm_graph_access_t access) 
         }
         profile_buffer_append(
             &buffer,
-            "Use the codebase-memory-neo4j MCP registration in the exact graph project. Use only read-only graph and "
+            "Use the codebase-memory-neo4j MCP registration in the exact graph project. Use only "
+            "read-only graph and "
             "source tools. Locate candidates with search_graph, "
             "inspect relationships with trace_path, and verify material definitions with "
             "get_code_snippet. Use query_graph or get_architecture only when available and "
@@ -528,8 +529,8 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             !profile_buffer_append(buffer, "tools:\n  - Read\n  - Grep\n  - Glob\n") ||
             (direct && !append_yaml_mcp_tools(buffer, dialect, tier)) ||
             (direct && !profile_buffer_append(buffer, "mcpServers: [codebase-memory-neo4j]\n")) ||
-            !profile_buffer_append(buffer,
-                                   "permissionMode: plan\nskills: [codebase-memory-neo4j]\n---\n") ||
+            !profile_buffer_append(
+                buffer, "permissionMode: plan\nskills: [codebase-memory-neo4j]\n---\n") ||
             !profile_buffer_append(buffer, prompt)) {
             return false;
         }
@@ -601,7 +602,8 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             (direct && (!profile_buffer_append(buffer, ",") ||
                         !append_csv_mcp_tools(buffer, dialect, tier))) ||
             !profile_buffer_append(buffer, "\n") ||
-            (direct && !profile_buffer_append(buffer, "mcpServers:\n  - codebase-memory-neo4j\n")) ||
+            (direct &&
+             !profile_buffer_append(buffer, "mcpServers:\n  - codebase-memory-neo4j\n")) ||
             !profile_buffer_append(buffer, "---\n") || !profile_buffer_append(buffer, prompt)) {
             return false;
         }
@@ -612,7 +614,8 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             (direct && (!profile_buffer_append(buffer, ",") ||
                         !append_csv_mcp_tools(buffer, dialect, tier))) ||
             !profile_buffer_append(
-                buffer, "\nmodel: inherit\npermissionMode: plan\nskills: codebase-memory-neo4j\n---\n") ||
+                buffer,
+                "\nmodel: inherit\npermissionMode: plan\nskills: codebase-memory-neo4j\n---\n") ||
             !profile_buffer_append(buffer, prompt)) {
             return false;
         }
@@ -651,12 +654,13 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             !profile_buffer_append(
                 buffer, direct ? "\nmcpInheritance:\n  named:\n    - codebase-memory-neo4j\n---\n"
                                : "\nmcpInheritance: none\n---\n") ||
-            (direct && (!profile_buffer_append(
-                            buffer, "Reach the graph only through `search_tool`/`use_tool`. "
-                                    "The only allowed tool ids are ") ||
-                        !append_csv_mcp_tools(buffer, dialect, tier) ||
-                        !profile_buffer_append(
-                            buffer, "; never call any other codebase-memory-mcp-neo4j tool.\n\n"))) ||
+            (direct &&
+             (!profile_buffer_append(buffer,
+                                     "Reach the graph only through `search_tool`/`use_tool`. "
+                                     "The only allowed tool ids are ") ||
+              !append_csv_mcp_tools(buffer, dialect, tier) ||
+              !profile_buffer_append(
+                  buffer, "; never call any other codebase-memory-mcp-neo4j tool.\n\n"))) ||
             !profile_buffer_append(buffer, prompt)) {
             return false;
         }

@@ -328,12 +328,12 @@ bool cbm_daemon_ipc_windows_legacy_names(const char *canonical_runtime_parent,
         hash ^= *cursor++;
         hash *= UINT64_C(1099511628211);
     }
-    int pipe_length =
-        snprintf(pipe_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP, "\\\\.\\pipe\\cbm-neo4j-daemon-%016llx-%s",
-                 (unsigned long long)hash, instance_key);
-    int mutex_length =
-        snprintf(startup_mutex_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP,
-                 "Local\\cbm-neo4j-daemon-%016llx-%s-startup", (unsigned long long)hash, instance_key);
+    int pipe_length = snprintf(pipe_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP,
+                               "\\\\.\\pipe\\cbm-neo4j-daemon-%016llx-%s", (unsigned long long)hash,
+                               instance_key);
+    int mutex_length = snprintf(startup_mutex_out, CBM_DAEMON_IPC_WINDOWS_NAME_CAP,
+                                "Local\\cbm-neo4j-daemon-%016llx-%s-startup",
+                                (unsigned long long)hash, instance_key);
     return pipe_length > 0 && (size_t)pipe_length < CBM_DAEMON_IPC_WINDOWS_NAME_CAP &&
            mutex_length > 0 && (size_t)mutex_length < CBM_DAEMON_IPC_WINDOWS_NAME_CAP;
 }
@@ -5707,8 +5707,8 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     char legacy_startup[CBM_DAEMON_IPC_WINDOWS_NAME_CAP];
     bool legacy_names_ok =
         cbm_daemon_ipc_windows_legacy_names(parent_utf8, instance_key, legacy_pipe, legacy_startup);
-    endpoint->runtime_dir =
-        string_format("%s%scbm-neo4j-daemon-%s", parent_utf8, has_separator ? "" : "/", instance_key);
+    endpoint->runtime_dir = string_format("%s%scbm-neo4j-daemon-%s", parent_utf8,
+                                          has_separator ? "" : "/", instance_key);
     endpoint->legacy_pipe_name = legacy_names_ok ? utf8_to_wide(legacy_pipe) : NULL;
     endpoint->legacy_startup_mutex_name = legacy_names_ok ? utf8_to_wide(legacy_startup) : NULL;
     (void)memcpy(endpoint->instance_key, instance_key, sizeof(endpoint->instance_key));

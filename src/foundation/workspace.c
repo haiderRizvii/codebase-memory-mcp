@@ -372,7 +372,8 @@ const char *cbm_workspace_verdict_reason(cbm_ws_verdict_t verdict) {
     case CBM_WS_DENY_TOO_SHALLOW:
         return "path is too broad to index as one root; name a project directory below it";
     case CBM_WS_DENY_ABSOLUTE:
-        return "path is a volume root or holds the codebase-memory-neo4j cache; it cannot be indexed";
+        return "path is a volume root or holds the codebase-memory-neo4j cache; it cannot be "
+               "indexed";
     case CBM_WS_DENY_SENSITIVE:
         return "path is a home, credential, system, or application-install directory";
     default:

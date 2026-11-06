@@ -583,20 +583,22 @@ static char *ha_coverage_context(const char *envelope, const char *rel, bool *is
         text = malloc(1536);
         if (text) {
             if (strcmp(status, "partial") == 0) {
-                snprintf(text, 1536,
-                         "[codebase-memory-neo4j] Coverage note: this file was only PARTIALLY indexed; "
-                         "line range(s) %s may be missing from graph results. freshness=%s. The "
-                         "source is ground truth; action=%s. (best-effort signal)",
-                         detail && detail[0] ? detail : "?", freshness ? freshness : "unavailable",
-                         action ? action : "read_file_and_verify_scope");
+                snprintf(
+                    text, 1536,
+                    "[codebase-memory-neo4j] Coverage note: this file was only PARTIALLY indexed; "
+                    "line range(s) %s may be missing from graph results. freshness=%s. The "
+                    "source is ground truth; action=%s. (best-effort signal)",
+                    detail && detail[0] ? detail : "?", freshness ? freshness : "unavailable",
+                    action ? action : "read_file_and_verify_scope");
             } else if (strcmp(status, "skipped") == 0 || strcmp(status, "excluded") == 0) {
-                snprintf(text, 1536,
-                         "[codebase-memory-neo4j] Coverage note: this file is not reliably represented "
-                         "in the graph (status=%s, kind=%s%s%s, freshness=%s). action=%s. "
-                         "(best-effort signal)",
-                         status, kind ? kind : "unknown", detail && detail[0] ? ": " : "",
-                         detail ? detail : "", freshness ? freshness : "unavailable",
-                         action ? action : "read_source_directly");
+                snprintf(
+                    text, 1536,
+                    "[codebase-memory-neo4j] Coverage note: this file is not reliably represented "
+                    "in the graph (status=%s, kind=%s%s%s, freshness=%s). action=%s. "
+                    "(best-effort signal)",
+                    status, kind ? kind : "unknown", detail && detail[0] ? ": " : "",
+                    detail ? detail : "", freshness ? freshness : "unavailable",
+                    action ? action : "read_source_directly");
             } else {
                 snprintf(text, 1536,
                          "[codebase-memory-neo4j] Coverage could not be established for this file "
@@ -1456,8 +1458,8 @@ static const char *ha_active_tier(yyjson_val *root, const char *event) {
     if (!agent_type) {
         agent_type = ha_obj_str(root, "agentType");
     }
-    if (agent_type &&
-        (strcmp(agent_type, "scout") == 0 || strcmp(agent_type, "codebase-memory-neo4j-scout") == 0)) {
+    if (agent_type && (strcmp(agent_type, "scout") == 0 ||
+                       strcmp(agent_type, "codebase-memory-neo4j-scout") == 0)) {
         return "Tier 1 quick scout";
     }
     if (agent_type && (strcmp(agent_type, "auditor") == 0 ||
@@ -1537,16 +1539,17 @@ static char *ha_lifecycle_json_from_root(cbm_mcp_server_t *srv, yyjson_val *root
                  scope, safe_project, tier);
     } else {
         const char *index_guidance = ha_no_project_index_guidance(event);
-        snprintf(context, sizeof(context),
-                 "[codebase-memory-neo4j] %s context: no indexed graph project matched this working "
-                 "directory. %s Once indexed, "
-                 "Active tier: %s. Router: scout=Tier 1 quick, verify=Tier 2 verification, "
-                 "auditor=Tier 3 full graph verification. Coverage invariant for every tier: "
-                 "call check_index_coverage for every file relied on; if incomplete, read the "
-                 "reported missed lines directly and qualify conclusions. Use search_graph, "
-                 "trace_path, and get_code_snippet first; use grep for "
-                 "literals, configs, non-code files, and verification.",
-                 scope, index_guidance, tier);
+        snprintf(
+            context, sizeof(context),
+            "[codebase-memory-neo4j] %s context: no indexed graph project matched this working "
+            "directory. %s Once indexed, "
+            "Active tier: %s. Router: scout=Tier 1 quick, verify=Tier 2 verification, "
+            "auditor=Tier 3 full graph verification. Coverage invariant for every tier: "
+            "call check_index_coverage for every file relied on; if incomplete, read the "
+            "reported missed lines directly and qualify conclusions. Use search_graph, "
+            "trace_path, and get_code_snippet first; use grep for "
+            "literals, configs, non-code files, and verification.",
+            scope, index_guidance, tier);
     }
     free(project);
     if (dialect == HA_DIALECT_COPILOT) {
@@ -1848,12 +1851,14 @@ const char *cbm_hook_admission_notice(cbm_hook_admission_t reason, const char *h
     switch (reason) {
     case CBM_HOOK_ADMISSION_DAEMON_ABSENT:
         return "{\"systemMessage\":\"codebase-memory-mcp-neo4j: no CBM daemon is running, so graph "
-               "augmentation is currently skipped. Run `codebase-memory-mcp-neo4j daemon start` (or "
+               "augmentation is currently skipped. Run `codebase-memory-mcp-neo4j daemon start` "
+               "(or "
                "open an MCP session) to enable it.\"}";
     case CBM_HOOK_ADMISSION_BUILD_CONFLICT:
         return "{\"systemMessage\":\"codebase-memory-mcp-neo4j: graph augmentation is skipped: the "
                "active CBM daemon runs a different build than this binary (usually an update was "
-               "installed while the old daemon kept running). Run `codebase-memory-mcp-neo4j daemon "
+               "installed while the old daemon kept running). Run `codebase-memory-mcp-neo4j "
+               "daemon "
                "stop`, then retry - the next command starts a matching daemon.\"}";
     default:
         return NULL;

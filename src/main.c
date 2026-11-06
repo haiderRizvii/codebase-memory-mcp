@@ -1224,10 +1224,10 @@ static int main_run_allow_root(int argc, char **argv) {
                    "always-refused roots (see docs/CONFIGURATION.md)\n");
         }
         if (!path && !list_only) {
-            (void)fprintf(stderr,
-                          "usage: codebase-memory-mcp-neo4j allow-root [--approve-sensitive] <path>\n"
-                          "       codebase-memory-mcp-neo4j allow-root --approve-manifest <project>\n"
-                          "       codebase-memory-mcp-neo4j allow-root --list\n");
+            (void)fprintf(
+                stderr, "usage: codebase-memory-mcp-neo4j allow-root [--approve-sensitive] <path>\n"
+                        "       codebase-memory-mcp-neo4j allow-root --approve-manifest <project>\n"
+                        "       codebase-memory-mcp-neo4j allow-root --list\n");
             return EXIT_FAILURE;
         }
         return 0;
@@ -1847,11 +1847,12 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
         return status;
     }
     if (report_lifecycle) {
-        (void)fprintf(stderr,
-                      "codebase-memory-mcp-neo4j: retiring the active permanent daemon (%s, pid %lu) "
-                      "for this newer build (%s)\n",
-                      active.semantic_version, (unsigned long)active.daemon_pid,
-                      config->identity->semantic_version);
+        (void)fprintf(
+            stderr,
+            "codebase-memory-mcp-neo4j: retiring the active permanent daemon (%s, pid %lu) "
+            "for this newer build (%s)\n",
+            active.semantic_version, (unsigned long)active.daemon_pid,
+            config->identity->semantic_version);
     }
     cbm_daemon_runtime_activation_result_t drain;
     if (!cbm_daemon_runtime_request_activation_shutdown(config->endpoint, config->identity,
@@ -1917,9 +1918,10 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
          * opts into this detail. It is advice for a person, so it is a plain
          * stderr line rather than a structured record whose value escaping
          * would turn `daemon start` into `daemon_start`. */
-        (void)fprintf(stderr, "hint: this command started a temporary CBM daemon. "
-                              "`codebase-memory-mcp-neo4j daemon start` keeps one warm and removes this "
-                              "startup cost from every CLI command.\n");
+        (void)fprintf(stderr,
+                      "hint: this command started a temporary CBM daemon. "
+                      "`codebase-memory-mcp-neo4j daemon start` keeps one warm and removes this "
+                      "startup cost from every CLI command.\n");
     }
     char session_root[MAIN_PATH_CAP];
     char allowed_root[MAIN_PATH_CAP];
@@ -2835,7 +2837,8 @@ int main(int argc, char **argv) {
         configure_stateless) {
         const char *settings_cache = cbm_resolve_cache_dir();
         if (settings_cache && !cbm_runtime_settings_init(settings_cache)) {
-            (void)fprintf(stderr, "codebase-memory-mcp-neo4j: could not load saved runtime settings\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: could not load saved runtime settings\n");
             return EXIT_FAILURE;
         }
     }
@@ -2858,8 +2861,9 @@ int main(int argc, char **argv) {
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
         cbm_mcp_parse_tool_profile_args(argc, (const char *const *)argv, &tool_profile) != 0) {
-        (void)fprintf(stderr, "codebase-memory-mcp-neo4j: --tool-profile requires the supported value "
-                              "'analysis' or 'scout'\n");
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp-neo4j: --tool-profile requires the supported value "
+                      "'analysis' or 'scout'\n");
         return 2;
     }
     const char *hook_event = NULL;
@@ -2964,10 +2968,11 @@ int main(int argc, char **argv) {
              * right it granted — and the daemon-endpoint path a few hundred
              * lines below has printed it since #1582. This path did not. */
             const char *why = cbm_daemon_ipc_validation_detail();
-            (void)fprintf(
-                stderr,
-                "codebase-memory-mcp-neo4j: secure CLI coordination could not be created (%s)%s%s\n",
-                coordination_failure, (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: secure CLI coordination could not be created "
+                          "(%s)%s%s\n",
+                          coordination_failure, (why && why[0]) ? ": " : "",
+                          (why && why[0]) ? why : "");
             goto local_cli_cleanup;
         }
         cbm_http_server_set_binary_path(local_executable);
@@ -2998,8 +3003,9 @@ int main(int argc, char **argv) {
             cbm_daemon_maintenance_monitor_start(cohort_manager, main_local_command_cancel,
                                                  &maintenance_context, EXIT_FAILURE, "CLI command");
         if (!maintenance_monitor) {
-            (void)fprintf(stderr,
-                          "codebase-memory-mcp-neo4j: CLI maintenance observer could not start safely\n");
+            (void)fprintf(
+                stderr,
+                "codebase-memory-mcp-neo4j: CLI maintenance observer could not start safely\n");
             goto local_cli_cleanup;
         }
 
@@ -3020,9 +3026,10 @@ int main(int argc, char **argv) {
                               "are none, retry shortly.\n",
                               MAIN_STARTUP_CONTENTION_CEILING_MS / 1000);
             } else {
-                (void)fprintf(stderr, "codebase-memory-mcp-neo4j: CLI startup coordination could not "
-                                      "be verified safely; retry after active CBM sessions "
-                                      "exit\n");
+                (void)fprintf(stderr,
+                              "codebase-memory-mcp-neo4j: CLI startup coordination could not "
+                              "be verified safely; retry after active CBM sessions "
+                              "exit\n");
             }
             goto local_cli_cleanup;
         }
@@ -3056,8 +3063,9 @@ int main(int argc, char **argv) {
             goto local_cli_cleanup;
         }
         if (!cbm_daemon_ipc_local_transition_begin_work(local_transition)) {
-            (void)fprintf(stderr, "codebase-memory-mcp-neo4j: CLI startup coordination could not enter "
-                                  "local work safely\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: CLI startup coordination could not enter "
+                          "local work safely\n");
             goto local_cli_cleanup;
         }
 
@@ -3413,16 +3421,18 @@ int main(int argc, char **argv) {
             cbm_daemon_application_client_set_ui_config(
                 g_daemon_client, update_mask, ui_enabled, ui_port,
                 bootstrap_config.startup_timeout_ms) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
-            (void)fprintf(stderr, "codebase-memory-mcp-neo4j: daemon UI configuration update failed\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: daemon UI configuration update failed\n");
             (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
             g_daemon_client = NULL;
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_FAILURE;
         }
         if (explicitly_enabled && !(CBM_EMBEDDED_FILE_COUNT > 0)) {
-            (void)fprintf(stderr, "codebase-memory-mcp-neo4j: --ui requested, but this binary was built "
-                                  "without UI support; rebuild with `make -f Makefile.cbm "
-                                  "cbm-with-ui`.\n");
+            (void)fprintf(stderr,
+                          "codebase-memory-mcp-neo4j: --ui requested, but this binary was built "
+                          "without UI support; rebuild with `make -f Makefile.cbm "
+                          "cbm-with-ui`.\n");
         }
     }
     /* The Windows branch of this call is the #914 fix: identical placement and

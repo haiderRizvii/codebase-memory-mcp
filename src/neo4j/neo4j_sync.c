@@ -21,9 +21,10 @@
 
 /* Columns written explicitly; a flattened property never overwrites them. */
 static const char *const k_reserved_node_keys[] = {
-    "db",         "gen",      "project",         "id",        "label",
-    "name",       "qualified_name", "file_path", "start_line", "end_line",
-    "properties_json", "prop_keys", NULL};
+    "db",         "gen",      "project",         "id",
+    "label",      "name",     "qualified_name",  "file_path",
+    "start_line", "end_line", "properties_json", "prop_keys",
+    NULL};
 static const char *const k_reserved_edge_keys[] = {"id", "type", "properties_json", "prop_keys",
                                                    NULL};
 
@@ -80,8 +81,7 @@ int cbm_neo4j_sidecar_read(const char *db_path, cbm_neo4j_config_t *cfg, char *s
     return rc == 0 ? 0 : -1;
 }
 
-int cbm_neo4j_sidecar_locate(const char *db_path, const char *project, char *out,
-                             size_t out_sz) {
+int cbm_neo4j_sidecar_locate(const char *db_path, const char *project, char *out, size_t out_sz) {
     char path[4096];
     if (cbm_neo4j_sidecar_path(db_path, path, sizeof(path)) == 0) {
         FILE *f = cbm_fopen(path, "rb");
@@ -620,9 +620,9 @@ fail:
 static int remote_generation(cbm_neo4j_t *c, const char *project, char *out, size_t out_sz) {
     out[0] = '\0';
     cbm_neo4j_result_t r;
-    if (run_simple(c,
-                   "MATCH (p:CbmProject {name: $db}) RETURN p.generation, coalesce(p.sync_format, 1)",
-                   project, 0, &r) != 0) {
+    if (run_simple(
+            c, "MATCH (p:CbmProject {name: $db}) RETURN p.generation, coalesce(p.sync_format, 1)",
+            project, 0, &r) != 0) {
         return -1;
     }
     yyjson_val *row = yyjson_arr_get_first(cbm_neo4j_result_data(&r, 0));
