@@ -84,3 +84,10 @@ installs both products in an isolated account, serves a checksum-verified local
 fork archive, repeats installation, runs both daemons, and uninstalls the fork.
 It checks upstream's executable, registration, hooks, skills, agents and updater
 survive. Linux containers must reap orphaned children and allow Unix sockets.
+
+`tests/test_fork_feature_parity.py --baseline /path/to/pre-rename-fork-binary`
+compares all advertised MCP tools and schemas, executes every tool on isolated
+multi-language fixtures, and checks CLI, configuration, profiles, cache and graph
+artifact isolation. Add `--ui-baseline /path/to/verified/upstream-release` when
+testing a fork build with embedded UI assets. See [FORK_VALIDATION.md](FORK_VALIDATION.md)
+for the completed audit and remaining platform/model-backed validation limits.

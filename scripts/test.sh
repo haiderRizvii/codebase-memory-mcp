@@ -289,6 +289,9 @@ bash "$ROOT/tests/test_soak_runtime_isolation_contract.sh"
 echo "=== Step 0e: Windows launcher bundle contract ==="
 bash "$ROOT/tests/test_windows_bundle_contract.sh"
 
+echo "=== Step 0e1: Docker graph entrypoint contract ==="
+bash "$ROOT/tests/test_docker_graph_entrypoint.sh"
+
 echo "=== Step 0e2: activation refusal diagnostic contract ==="
 bash "$ROOT/tests/test_activation_diagnostic_contract.sh"
 

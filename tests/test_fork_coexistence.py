@@ -73,7 +73,9 @@ def main():
         updater.write_text('# upstream updater sentinel\n')
         snapshots = {}
         for directory_name in ['.claude/hooks', '.claude/skills', '.claude/agents',
-                               '.pi/agent/extensions', '.config/opencode/plugins']:
+                               '.codex/skills', '.codex/agents', '.cursor/skills', '.cursor/agents',
+                               '.pi/agent/extensions', '.config/opencode/plugins',
+                               '.config/opencode/skills', '.config/opencode/agents']:
             for file in (home / directory_name).rglob('*'):
                 if file.is_file():
                     snapshots[file] = file.read_bytes()
@@ -81,6 +83,8 @@ def main():
         codex = home / '.codex/config.toml'
         original_claude = json.loads(claude.read_text())['mcpServers']['codebase-memory-mcp']
         original_codex = tomllib.loads(codex.read_text())['mcp_servers']['codebase-memory-mcp']
+        cursor = home / '.cursor/mcp.json'
+        original_cursor = json.loads(cursor.read_text())['mcpServers']['codebase-memory-mcp']
         release = work / 'release'
         release.mkdir()
         archive = release / f'{FORK}-linux-amd64-portable.tar.gz'
@@ -108,8 +112,12 @@ def main():
                 t = tomllib.loads(codex.read_text())['mcp_servers']
                 assert t['codebase-memory-mcp'] == original_codex
                 assert t[ID]['command'] == str(fork)
+                assert json.loads(cursor.read_text())['mcpServers']['codebase-memory-mcp'] == original_cursor
                 for file, data in snapshots.items():
                     assert file.read_bytes() == data, f'upstream resource changed: {file}'
+            handoff = run([fork, 'update'])
+            assert str(bindir / 'install-neo4j.sh') in handoff, handoff
+            assert updater.read_text() == '# upstream updater sentinel\n'
             run([upstream, 'daemon', 'start'])
             run([fork, 'daemon', 'start'])
             assert 'active' in run([upstream, 'daemon', 'status'])
@@ -125,6 +133,7 @@ def main():
             assert json.loads(claude.read_text())['mcpServers']['codebase-memory-mcp'] == original_claude
             assert ID not in json.loads(claude.read_text())['mcpServers']
             assert tomllib.loads(codex.read_text())['mcp_servers']['codebase-memory-mcp'] == original_codex
+            assert json.loads(cursor.read_text())['mcpServers']['codebase-memory-mcp'] == original_cursor
             for file, data in snapshots.items():
                 assert file.read_bytes() == data, f'upstream resource removed: {file}'
             assert updater.read_text() == '# upstream updater sentinel\n'

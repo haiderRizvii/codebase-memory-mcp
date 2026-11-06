@@ -99,6 +99,13 @@ This removes Neo4j's data and the indexer's cache volumes (`cbm_neo4j-data`,
 
 ## How it works
 
+The entrypoint creates private state with a restrictive umask, requests explicit
+machine-readable CLI output, and reads the top-level indexing result independently
+of Neo4j's nested backend status. The runtime image includes the required JSON parser.
+For volumes created by older entrypoints, check that the dedicated `/data/home`
+directory is owned by the container user and has mode `0700`; an insecure existing
+directory is intentionally rejected by runtime settings rather than silently trusted.
+
 - The indexer syncs the repo into the `cbm_cbm-data` volume, skipping paths
   matched by the ignore rules. It writes the merged `.cbmignore` at the copy's
   root and indexes the copy. Your repo is never touched, and repeat runs only
