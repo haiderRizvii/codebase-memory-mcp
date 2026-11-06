@@ -493,7 +493,7 @@ fi
 # they stay that way.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
-WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
+WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp-neo4j"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
 # Step 5a: that watchdog is also the SMALLEST-stack thread in the image, which

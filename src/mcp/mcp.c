@@ -556,7 +556,7 @@ static const tool_def_t TOOLS[] = {
      "\"name\":{\"type\":\"string\",\"description\":"
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
-     "\"Write .codebase-memory/graph.db.zst.\"},"
+     "\"Write .codebase-memory-neo4j/graph.db.zst.\"},"
      "\"doc_candidates\":{\"type\":\"boolean\",\"description\":"
      "\"Doc-code candidates; default: the doc_candidates setting, else on for full, off for "
      "moderate/fast.\"},"
@@ -1473,7 +1473,7 @@ static const int SUPPORTED_VERSION_COUNT =
  * questions the graph answers; facts, not commands. Claude Code cuts them at
  * 4,096 characters. */
 static const char MCP_SERVER_INSTRUCTIONS[] =
-    "codebase-memory-mcp is a code knowledge graph of the indexed repository: functions, "
+    "codebase-memory-mcp-neo4j is a code knowledge graph of the indexed repository: functions, "
     "classes, methods, routes, calls, imports, inheritance and cross-service links. It answers "
     "structural code questions: where a symbol is defined, who calls a function, what a function "
     "calls, call chains and data flow, which code a change affects, which handler serves a route, "
@@ -1535,7 +1535,7 @@ static char *cbm_mcp_initialize_response_for_profile(const char *params_json,
     yyjson_mut_obj_add_str(doc, root, "protocolVersion", version);
 
     yyjson_mut_val *impl = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp");
+    yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp-neo4j");
     yyjson_mut_obj_add_str(doc, impl, "version", cbm_cli_get_version());
     yyjson_mut_obj_add_val(doc, root, "serverInfo", impl);
 
@@ -1724,7 +1724,7 @@ static char *normalize_project_arg(char *project) {
 /* Forward decls — defined below alongside store resolution. */
 static const char *cache_dir(char *buf, size_t bufsz);
 
-/* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp"),
+/* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp-neo4j"),
  * but indexed project names derive from the full path
  * (E:\project\graph\x -> "E-project-graph-x"), so the exact lookup fails
  * while list_projects clearly shows the project. When no <project>.db exists,
@@ -2921,7 +2921,7 @@ static bool project_has_adr(cbm_store_t *store, const char *project, const char 
     }
 
     char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
+    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory-neo4j/adr.md", root_path);
     struct stat adr_st;
     return stat(adr_path, &adr_st) == 0;
 }
@@ -11575,7 +11575,7 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
             partials++;
         }
     }
-    (void)fprintf(f, "# codebase-memory-mcp index coverage report\n");
+    (void)fprintf(f, "# codebase-memory-mcp-neo4j index coverage report\n");
     (void)fprintf(f, "# project=%s skipped=%d parse_partial=%d\n", project ? project : "",
                   count - partials, partials);
     (void)fprintf(f, "# columns: phase\treason\tpath\n");
@@ -11682,7 +11682,7 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     yyjson_mut_obj_add_bool(doc, root, "artifact_present", has_artifact);
     if (persistence && has_artifact) {
         yyjson_mut_obj_add_str(doc, root, "artifact_hint",
-                               "Persistent artifact written to .codebase-memory/graph.db.zst. "
+                               "Persistent artifact written to .codebase-memory-neo4j/graph.db.zst. "
                                "Commit this file to share the index with teammates.");
     }
 
@@ -13152,7 +13152,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             (void)snprintf(
                 hint, sizeof(hint),
                 "Index database was published, but the persistence artifact export failed for "
-                "repo_path/.codebase-memory (%s). Use a writable checkout, or re-run with "
+                "repo_path/.codebase-memory-neo4j (%s). Use a writable checkout, or re-run with "
                 "--persistence false if the shared artifact is not needed.",
                 export_error);
             yyjson_mut_obj_add_strcpy(doc, root, "hint", hint);
@@ -20588,7 +20588,7 @@ static void adr_add_outline(yyjson_mut_doc *doc, yyjson_mut_val *root_obj, const
     free(rows);
 }
 
-/* Read the legacy file-based ADR (<root>/.codebase-memory/adr.md), used by
+/* Read the legacy file-based ADR (<root>/.codebase-memory-neo4j/adr.md), used by
  * older versions. Returns a heap buffer (caller frees) or NULL if missing/
  * empty. Kept only to migrate old ADRs into the store (#256). */
 static char *adr_read_legacy_file(const char *root_path) {
@@ -20596,7 +20596,7 @@ static char *adr_read_legacy_file(const char *root_path) {
         return NULL;
     }
     char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
+    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory-neo4j/adr.md", root_path);
     FILE *fp = cbm_fopen(adr_path, "r");
     if (!fp) {
         return NULL;
@@ -20923,7 +20923,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* One-time migration: older versions wrote ADRs to a file at
-     * <root>/.codebase-memory/adr.md. A read never waits for the project lease:
+     * <root>/.codebase-memory-neo4j/adr.md. A read never waits for the project lease:
      * it returns the legacy content immediately and attempts migration only if
      * a nonblocking acquire succeeds. */
     cbm_adr_t adr;
@@ -21796,7 +21796,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
     if (!auto_index) {
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
-                     "run: codebase-memory-mcp config set auto_index true");
+                     "run: codebase-memory-mcp-neo4j config set auto_index true");
         return;
     }
 

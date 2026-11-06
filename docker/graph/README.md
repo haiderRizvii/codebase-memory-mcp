@@ -7,7 +7,7 @@ and no installed binary are needed:
 |---|---|
 | `neo4j` | Neo4j 5.26 (container `cbm-neo4j`), data in the `cbm_neo4j-data` volume. Browser: http://localhost:7474 |
 | `cbm` | The indexer: builds a repository's graph into that Neo4j. |
-| `mcp` | The codebase-memory-mcp server (stdio) for Claude Code and other MCP clients. |
+| `mcp` | The codebase-memory-mcp-neo4j server (stdio) for Claude Code and other MCP clients. |
 
 `cbm` and `mcp` are built from this checkout, so they run whatever branch is checked out.
 
@@ -29,7 +29,7 @@ NEO4J_PASSWORD=<long random password>
 ## Set up (once per machine)
 
 ```powershell
-cd D:\ai-skills\codebase-memory-mcp-fork
+cd D:\ai-skills\codebase-memory-mcp-neo4j-fork
 copy docker\graph\.env.example docker\graph\.env    # then edit NEO4J_PASSWORD
 docker compose -f docker/graph/compose.yaml up -d neo4j
 docker compose -f docker/graph/compose.yaml --profile tools build cbm   # ~10-15 min
@@ -40,7 +40,7 @@ Rebuild with the last command after pulling code changes.
 ## Graph a repository
 
 ```powershell
-D:\ai-skills\codebase-memory-mcp-fork\docker\graph\cbm-graph.cmd -RepoPath "D:\batch applications"
+D:\ai-skills\codebase-memory-mcp-neo4j-fork\docker\graph\cbm-graph.cmd -RepoPath "D:\batch applications"
 ```
 
 | Option | Default | Meaning |
@@ -69,7 +69,7 @@ docker compose -f docker/graph/compose.yaml run --rm \
 Register the containerised server once:
 
 ```powershell
-claude mcp add codebase-memory --scope user -- docker compose -f D:/ai-skills/codebase-memory-mcp-fork/docker/graph/compose.yaml run --rm -T mcp
+claude mcp add codebase-memory-neo4j --scope user -- docker compose -f D:/ai-skills/codebase-memory-mcp-neo4j-fork/docker/graph/compose.yaml run --rm -T mcp
 ```
 
 It answers from the graphs the indexer built (they share the `cbm_cbm-data`
@@ -106,4 +106,4 @@ This removes Neo4j's data and the indexer's cache volumes (`cbm_neo4j-data`,
   `/repos/<name>` and indexed there.
 - The graph is published to Neo4j generation by generation, so a re-run never
   leaves a half-written graph. If the upload fails, the run fails.
-- To remove one project's graph: `docker compose -f docker/graph/compose.yaml run --rm --entrypoint codebase-memory-mcp cbm cli delete_project --project <name>`.
+- To remove one project's graph: `docker compose -f docker/graph/compose.yaml run --rm --entrypoint codebase-memory-mcp-neo4j cbm cli delete_project --project <name>`.
