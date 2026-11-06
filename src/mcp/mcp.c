@@ -7824,6 +7824,13 @@ static void add_graph_backend_report(yyjson_mut_doc *doc, yyjson_mut_val *root, 
             if (last_error[0]) {
                 yyjson_mut_obj_add_strcpy(doc, gb, "last_sync_error", last_error);
             }
+            /* What the last successful sync sent: a delta's counts, or a full
+             * upload and why the delta could not be used. */
+            char last_sync[CBM_SZ_512] = "";
+            (void)cbm_neo4j_sidecar_field(path, "last_sync", last_sync, sizeof(last_sync));
+            if (last_sync[0]) {
+                yyjson_mut_obj_add_strcpy(doc, gb, "last_sync", last_sync);
+            }
         }
         bool attached = cbm_store_is_remote(store);
         yyjson_mut_obj_add_str(doc, gb, "status", attached ? "serving" : "unavailable");
