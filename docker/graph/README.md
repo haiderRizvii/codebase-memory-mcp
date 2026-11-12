@@ -138,6 +138,16 @@ directory is intentionally rejected by runtime settings rather than silently tru
   root and indexes the copy. Your repo is never touched, and repeat runs only
   copy what changed. With `-NoCopy` the repo is mounted read-only at
   `/repos/<name>` and indexed there.
+- The first run uploads the whole graph. Later runs send Neo4j only the nodes
+  and edges that changed (a delta, in one Neo4j transaction). The run prints
+  what it did as `last_sync:`, for example
+  `delta: nodes +2 ~5 -0, edges +7 ~1 -3 (graph: …)`. A run whose change is
+  very large (over `CBM_NEO4J_DELTA_MAX_ROWS`, default 50000) uploads in full.
+  Either way a run never leaves a half-written graph, and if the upload
+  fails, the run fails. The delta's record of what Neo4j holds is
+  `<project>.db.neo4j-state.db` next to the project's index in the `cbm-data`
+  volume. Deleting it only makes the next run a full upload.
+- To remove one project's graph: `docker compose -f docker/graph/compose.yaml run --rm --entrypoint codebase-memory-mcp cbm cli delete_project --project <name>`.
 - The graph is published to Neo4j generation by generation, so a re-run never
   leaves a half-written graph. If the upload fails, the run fails.
 - To remove one project's graph: `docker compose -f docker/graph/compose.yaml run --rm --entrypoint codebase-memory-mcp-neo4j cbm cli delete_project --project <name>`.
