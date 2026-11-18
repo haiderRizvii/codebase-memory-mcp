@@ -101,7 +101,7 @@
   {
    "id": "PG-04",
    "tier": 2,
-   "title": "limit 0 is rejected",
+   "title": "limit 0 is clamped to the minimum (1), never an empty page",
    "tool": "search_graph",
    "args": {
     "project": "{{project}}",
@@ -111,7 +111,14 @@
    },
    "wait": 120,
    "expect": {
-    "ok": false
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "eq",
+      "value": 1
+     }
+    ]
    }
   },
   {
@@ -147,7 +154,7 @@
   {
    "id": "PG-06",
    "tier": 2,
-   "title": "negative offset is rejected",
+   "title": "negative offset is clamped to 0 (the first page)",
    "tool": "search_graph",
    "args": {
     "project": "{{project}}",
@@ -157,7 +164,14 @@
    },
    "wait": 120,
    "expect": {
-    "ok": false
+    "ok": true,
+    "json": [
+     {
+      "path": "returned",
+      "op": "gte",
+      "value": 1
+     }
+    ]
    }
   },
   {

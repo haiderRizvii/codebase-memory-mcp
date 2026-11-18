@@ -402,33 +402,49 @@
   {
    "id": "TP-20",
    "tier": 2,
-   "title": "depth 16 is rejected",
+   "title": "depth 16 is clamped to the maximum (15) and still answers",
    "tool": "trace_path",
    "args": {
     "project": "{{project}}",
     "function_name": "hub",
     "depth": 16,
-    "format": "json"
+    "format": "json",
+    "direction": "inbound"
    },
    "wait": 300,
    "expect": {
-    "ok": false
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 12
+     }
+    ]
    }
   },
   {
    "id": "TP-21",
    "tier": 2,
-   "title": "depth 0 is rejected",
+   "title": "depth 0 is clamped to 1: the direct callers, never an empty trace",
    "tool": "trace_path",
    "args": {
     "project": "{{project}}",
     "function_name": "hub",
     "depth": 0,
-    "format": "json"
+    "format": "json",
+    "direction": "inbound"
    },
    "wait": 300,
    "expect": {
-    "ok": false
+    "ok": true,
+    "json": [
+     {
+      "path": "callers_total",
+      "op": "eq",
+      "value": 12
+     }
+    ]
    }
   },
   {

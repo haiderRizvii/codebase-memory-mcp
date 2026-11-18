@@ -167,7 +167,7 @@
   {
    "id": "N03-10",
    "tier": 2,
-   "title": "…a docstring edit changes a handful of rows, adds and removes none (measured 2-9 on a 1,750-row graph)",
+   "title": "a docstring edit is a small delta confined to the edited file: the incremental route re-creates that file's nodes with fresh ids (contentless FTS rows are never reused), so they show as a few adds and removes; nothing else moves (measured +4 -4 nodes on a 137-node graph)",
    "tool": "index_status",
    "args": {
     "project": "{{project}}",
@@ -180,7 +180,7 @@
      {
       "path": "graph_backend.last_sync",
       "op": "regex",
-      "value": "^delta: nodes \\+0 ~[1-9][0-9]? -0, edges \\+[0-9]+ ~[0-9]+ -[0-9]+"
+      "value": "^delta: nodes \\+[0-9] ~[0-9]{1,2} -[0-9], edges \\+[0-9]{1,2} ~[0-9]{1,2} -[0-9]{1,2} "
      }
     ]
    }

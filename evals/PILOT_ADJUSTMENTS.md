@@ -93,3 +93,45 @@ Case-file changes made during the first execution, where the eval (not the produ
 | S99-04 (assertions.py) | | | an empty table has no column names; 'excludes' now holds on an empty list |
 | expected/eval-small.json | orders, db | Service/orders, Service/db | compose services are indexed as Service/<name>; the two tier-2 'misses' in the first coverage report were this naming slip |
 | N09-22, run_cases.py | | | fs steps may name their own root (the medium repo); an unexpected exception is now recorded as a failed step instead of ending the suite (N09-22..27 had not run) |
+
+# Round 2 (2026-11-18, DEV 87bc455b + branch fix/eval-findings)
+
+Re-run of every suite on both backends (with `--with-scale`). Baseline on DEV:
+836 pass, 50 fail (19 tier-1). After the product fixes on `fix/eval-findings`
+and the eval corrections below: 887 pass, 1 fail (tier 2), 0 tier-1 failures. The one
+tier-2 failure is N08-03 (SEM-01): semantic vectors include the project name, so the
+two twin projects rank a few rows differently; it is expected.
+
+## Eval corrections (the eval was wrong)
+
+| Step | Was | Now | Why |
+|---|---|---|---|
+| PG-04, PG-06 | limit 0 / offset -1 rejected | clamped (limit 1, offset 0) | search_graph clamps out-of-range paging by design (#887); it never returns a wrong page |
+| TP-20, TP-21 | depth 16 / 0 rejected | clamped to 15 / 1, 12 hub callers | trace_path clamps depth like the other tools; depth 0 used to answer "no callers" (fixed in the product) |
+| N05-12 | check_index_coverage works while Neo4j is down | refused, names Neo4j | coverage reads graph nodes; graph reads never fall back to the local index |
+| N06-25b, N06-26b | (new) | index / delete the SQLite twin inside N06 | the SQLite profile's own cleanup deletes the twin, so N06-26 hit "project not found" |
+| SEM-02 | phrases | keywords | semantic_query takes keywords; each is scored on its own |
+| SEM-05, SEM-06 | semantic rows filtered by label / file | structural page filtered, semantic set returned beside it | documented contract: combined calls keep both independently ranked result sets |
+| SEM-08 | SEMANTICALLY_RELATED present | schema lists CALLS | eval-small has no bodies similar enough; BATCH-SRVC has thousands of such edges |
+| N03-10 | docstring edit: +0 -0 nodes | small delta, single-digit adds/removes | the incremental route re-creates the edited file's nodes with fresh ids (contentless FTS rows are never reused) |
+| SG-07d | bracket class in file_pattern | brackets are literal | by design: `pages/[id].tsx` must stay findable; classes belong in name/qn regexes |
+| SG-07a/b/c, N07-06a | DEFECT PIN | REGRESSION (fixed) | the defects they pinned are fixed on fix/eval-findings |
+
+## Product defects found and fixed (branch fix/eval-findings)
+
+| Steps | Defect |
+|---|---|
+| SG-07, SG-07a, SG-07c | regex LIKE pre-filter treated `[a-z]`, groups and optional atoms as literal text: 0 rows |
+| SG-07b | POSIX ERE has no `\d`: `fn\d+` meant "fn" + letter d; cbm_regcomp now rewrites `\d \w \s` (and negations) |
+| N04-09..19 | a graph deleted in Neo4j (or its pointer moved) was served as an empty answer and an unchanged re-index skipped the upload |
+| N05-24, N07-06a | a wrong graph_password on one index request replaced the daemon's remembered login for every project on that server |
+| N02-30 | an unchanged re-index skipped the schema step, so a dropped Neo4j index stayed dropped |
+| N06-06 | native query replies did not say they were served by Neo4j |
+| QG-17 | toLower / toUpper / toString in WHERE were a syntax error |
+| QG-27 | syntax errors said "expected token type 85, got 68" |
+| S03-08 | BM25 dropped non-ASCII bytes: an accented identifier was unsearchable |
+| TP-21 | trace_path depth 0 answered "no callers, no callees" |
+| N08-02 (SG-25) | invalid regex: different error text per backend |
+| N08-11 | get_architecture tie order differed between two indexes of the same code |
+| N09-10b/c | Java: calls on a type imported from another package went unresolved (19,800 of 19,999); on BATCH-SRVC the type-aware share of CALLS rose from 17% to 36% and about 28k call sites now point at the right method |
+| (perf, BATCH-SRVC) | Neo4j: a regex name search fetched every candidate of a weak literal hint (now pre-filtered with =~ in Neo4j); relationship filter read every relationship's type property (now a typed EXISTS, 4.6 s -> 0.5 s); query_graph scans of 50k-350k nodes streamed through the engine for ~5 s instead of Neo4j answering in < 0.5 s |

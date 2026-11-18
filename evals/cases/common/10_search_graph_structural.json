@@ -181,7 +181,7 @@
   {
    "id": "SG-07a",
    "tier": 1,
-   "title": "DEFECT PIN: a [a-z]+ range in name_pattern finds unused_helper",
+   "title": "REGRESSION (fixed 2026-11-18): a [a-z]+ range in name_pattern finds unused_helper (the LIKE pre-filter used \"a-z\" as literal text)",
    "tool": "search_graph",
    "args": {
     "project": "{{project}}",
@@ -201,7 +201,7 @@
   {
    "id": "SG-07b",
    "tier": 1,
-   "title": "DEFECT PIN: \\d in name_pattern matches digits",
+   "title": "REGRESSION (fixed 2026-11-18): \\d in name_pattern matches digits (POSIX ERE has no \\d; cbm_regcomp now rewrites \\d \\w \\s)",
    "tool": "search_graph",
    "args": {
     "project": "{{project}}",
@@ -220,7 +220,7 @@
   {
    "id": "SG-07c",
    "tier": 1,
-   "title": "DEFECT PIN: a range in qn_pattern",
+   "title": "REGRESSION (fixed 2026-11-18): a range in qn_pattern",
    "tool": "search_graph",
    "args": {
     "project": "{{project}}",
@@ -239,7 +239,7 @@
   {
    "id": "SG-07d",
    "tier": 2,
-   "title": "DEFECT PIN: a [ab] bracket class in a file_pattern glob",
+   "title": "BY DESIGN: brackets in file_pattern are literal path text (pages/[id].tsx must stay findable), so dup/[ab]*.py matches no file; use a name/qn regex for classes",
    "tool": "search_graph",
    "args": {
     "project": "{{project}}",
@@ -252,7 +252,7 @@
     "ok": true,
     "rows": {
      "table": "",
-     "count_eq": 2
+     "count_eq": 0
     }
    }
   },

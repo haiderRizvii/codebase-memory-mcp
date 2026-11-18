@@ -3,7 +3,7 @@
 Black-box evals of `codebase-memory-mcp-neo4j` through MCP: does indexing cover
 what is on disk, are the Neo4j schema indexes created and used, and do the
 search tools answer correctly and identically on the **SQLite** and **Neo4j**
-backends. Written 2026-11-12; **not yet executed** — see "Pilot" below.
+backends. Written 2026-11-12; first run 2026-11-12, second full run 2026-11-18 (see PILOT_ADJUSTMENTS.md).
 
 ```
 evals/

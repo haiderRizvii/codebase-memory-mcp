@@ -205,7 +205,7 @@
   {
    "id": "N05-12",
    "tier": 2,
-   "title": "check_index_coverage (local metadata) keeps working",
+   "title": "check_index_coverage reads graph nodes, so it is refused like every graph read (no local fallback) and names the cause",
    "tool": "check_index_coverage",
    "args": {
     "project": "{{project}}",
@@ -216,7 +216,15 @@
    },
    "wait": 120,
    "expect": {
-    "ok": true
+    "ok": false,
+    "text_regex": "(?i)neo4j",
+    "json": [
+     {
+      "path": "graph_backend.status",
+      "op": "eq",
+      "value": "unavailable"
+     }
+    ]
    }
   },
   {

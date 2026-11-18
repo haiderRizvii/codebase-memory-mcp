@@ -92,7 +92,7 @@
   {
    "id": "N07-06a",
    "tier": 1,
-   "title": "DEFECT PIN: right after another project's failed login, this project still reads",
+   "title": "REGRESSION (fixed 2026-11-18): right after another project's failed login, this project still reads",
    "tool": "search_graph",
    "args": {
     "project": "{{project}}",

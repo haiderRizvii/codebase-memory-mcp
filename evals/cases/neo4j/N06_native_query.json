@@ -474,6 +474,22 @@
    }
   },
   {
+   "id": "N06-25b",
+   "tier": 2,
+   "skip_if": "no_var:project_twin",
+   "title": "index the SQLite-only twin (the SQLite profile cleans its own project up)",
+   "tool": "index_repository",
+   "args": {
+    "repo_path": "{{repo}}",
+    "name": "{{project_twin}}",
+    "format": "json"
+   },
+   "wait": 1800,
+   "expect": {
+    "ok": true
+   }
+  },
+  {
    "id": "N06-26",
    "tier": 1,
    "title": "native on a plain SQLite project is refused",
@@ -489,6 +505,21 @@
    "expect": {
     "ok": false,
     "text_regex": "(?i)neo4j"
+   }
+  },
+  {
+   "id": "N06-26b",
+   "tier": 2,
+   "skip_if": "no_var:project_twin",
+   "title": "remove the twin again",
+   "tool": "delete_project",
+   "args": {
+    "project": "{{project_twin}}",
+    "format": "json"
+   },
+   "wait": 300,
+   "expect": {
+    "ok": true
    }
   },
   {
