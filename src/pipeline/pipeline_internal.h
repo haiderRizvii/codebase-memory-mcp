@@ -522,6 +522,14 @@ typedef struct {
     struct cbm_doclinks *doc_links;
     const struct cbm_doclink_scope *doc_link_base;
     int doc_link_base_count;
+    /* The declared namespace/package of every file an incremental run does
+     * NOT re-parse (parallel arrays, borrowed; NULL in a full run). The
+     * registry pass adds them to the namespace map, so an import of an
+     * unchanged file resolves to it exactly as a full build would, instead of
+     * to whichever re-parsed file of the package happens to be present. */
+    const char *const *ns_base_rels;
+    const char *const *ns_base_names;
+    int ns_base_count;
     bool doc_links_failed;
 
     /* The run's Terraform helm_releases (pass_terraform.c fills them, the K8s
