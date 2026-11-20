@@ -1387,10 +1387,38 @@ static char *pxc_kotlin_import_from_metadata(const CBMFileResult *result, const 
  * Reattach that member only when the raw metadata proves one unique,
  * non-aliased path. The shared Python registry must still materialize the
  * resulting exact QN before it earns CALL_REFERENCE. */
-static char *pxc_import_value_qn(CBMLanguage lang, const CBMFileResult *result,
-                                 const char *local_name, const cbm_gbuf_node_t *target) {
+/* A Java import binds a TYPE, but its IMPORTS edge targets the declaring
+ * File node. Map it to the type of that name declared in that file, so the
+ * CALLS import map resolves `Type.method` exactly instead of by name. */
+static const cbm_gbuf_node_t *pxc_jvm_type_in_file(const cbm_gbuf_t *gbuf, const char *local_name,
+                                                   const cbm_gbuf_node_t *file) {
+    if (!gbuf || !local_name || !file || !file->file_path || !file->label ||
+        strcmp(file->label, "File") != 0)
+        return NULL;
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, local_name, &nodes, &count) != 0)
+        return NULL;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *n = nodes[i];
+        if (n && n->file_path && n->label && strcmp(n->file_path, file->file_path) == 0 &&
+            (strcmp(n->label, "Class") == 0 || strcmp(n->label, "Interface") == 0 ||
+             strcmp(n->label, "Enum") == 0 || strcmp(n->label, "Type") == 0))
+            return n;
+    }
+    return NULL;
+}
+
+static char *pxc_import_value_qn(const cbm_gbuf_t *gbuf, CBMLanguage lang,
+                                 const CBMFileResult *result, const char *local_name,
+                                 const cbm_gbuf_node_t *target) {
     if (!target || !target->qualified_name)
         return NULL;
+    if (lang == CBM_LANG_JAVA) {
+        const cbm_gbuf_node_t *type = pxc_jvm_type_in_file(gbuf, local_name, target);
+        if (type && type->qualified_name)
+            return strdup(type->qualified_name);
+    }
     if (lang == CBM_LANG_KOTLIN)
         return pxc_kotlin_import_from_metadata(result, local_name);
     if (lang != CBM_LANG_PYTHON)
@@ -1560,7 +1588,7 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
         /* An annotation-only import (#1277) binds no CALLS name: it gets no value. */
         bool binds = include_type_only ||
                      cbm_imports_local_binds_runtime_name(result ? &result->imports : NULL, local);
-        char *value = binds ? pxc_import_value_qn(lang, result, local, target) : NULL;
+        char *value = binds ? pxc_import_value_qn(gbuf, lang, result, local, target) : NULL;
         if (!value) {
             free(local);
             continue;
