@@ -1446,6 +1446,12 @@ typedef struct {
      * the arenas live exactly as long as cr.arena itself. */
     CBMArena *rehydrate_arenas;
     int rehydrate_arena_count;
+    /* Declared namespace of each rehydrated (not re-parsed) file, for the
+     * registry pass's namespace map (ctx.ns_base_*). Heap arrays; the strings
+     * are borrowed from plan->stored_rows and the rehydrate arenas. */
+    const char **ns_rels;
+    const char **ns_names;
+    int ns_count;
 } closure_resolve_t;
 
 typedef struct {
@@ -3449,6 +3455,28 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             }
             total += row_counts[i];
         }
+        /* The file's declared namespace is carried on its defs ("ns"); the
+         * first def that has one names the file's package, which is the key
+         * the full build's namespace map uses for that file. */
+        if (decode_ok && elig_count > 0) {
+            cr.ns_rels = (const char **)calloc((size_t)elig_count, sizeof(char *));
+            cr.ns_names = (const char **)calloc((size_t)elig_count, sizeof(char *));
+            if (!cr.ns_rels || !cr.ns_names) {
+                decode_ok = false;
+            } else {
+                for (int i = 0; i < elig_count; i++) {
+                    for (int d = 0; d < row_counts[i]; d++) {
+                        const char *ns = row_defs[i][d].namespace_name;
+                        if (ns && ns[0]) {
+                            cr.ns_rels[cr.ns_count] = elig[i]->rel_path;
+                            cr.ns_names[cr.ns_count] = ns;
+                            cr.ns_count++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         if (decode_ok && total > 0) {
             cr.base_defs =
                 (CBMLSPDef *)cbm_arena_alloc(&cr.arena, (size_t)total * sizeof(CBMLSPDef));
@@ -3506,6 +3534,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
         .build_decl_count = decl_count,
         .stem_marks = &stem_marks,
         .envjoin_base = &envjoin_base,
+        .ns_base_rels = cr.ns_rels,
+        .ns_base_names = cr.ns_names,
+        .ns_base_count = cr.ns_count,
     };
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
@@ -3796,6 +3827,8 @@ out:
             cbm_arena_destroy(&cr.rehydrate_arenas[i]);
         }
         free(cr.rehydrate_arenas);
+        free(cr.ns_rels);
+        free(cr.ns_names);
         cbm_arena_destroy(&cr.arena);
     }
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count);
