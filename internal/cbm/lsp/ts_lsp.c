@@ -27,6 +27,7 @@
  */
 
 #include "ts_lsp.h"
+#include "lsp_work.h"
 #include "../../../src/foundation/platform.h"
 #include "../helpers.h"
 #include "../../../src/foundation/log.h"
@@ -269,8 +270,12 @@ static TSNode find_first_kind(TSNode node, const char *kind) {
     return null_node;
 }
 
-static void ts_emit_resolved_call_at(TSLSPContext *ctx, const char *callee_qn, const char *strategy,
-                                     float confidence, TSNode site) {
+/* `reason` carries the name written at the site when it differs from the
+ * callee's leaf (`bar()` through `import { foo as bar }`): the pipeline joins an
+ * alias strategy by that name instead of by the callee QN's last segment. */
+static void ts_emit_resolved_call_reason_at(TSLSPContext *ctx, const char *callee_qn,
+                                            const char *strategy, float confidence,
+                                            const char *reason, TSNode site) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
     CBMResolvedCall rc = {0};
@@ -278,7 +283,7 @@ static void ts_emit_resolved_call_at(TSLSPContext *ctx, const char *callee_qn, c
     rc.callee_qn = callee_qn;
     rc.strategy = strategy ? strategy : "lsp_ts";
     rc.confidence = confidence;
-    rc.reason = NULL;
+    rc.reason = reason;
     rc.kind = CBM_RESOLVED_INVOCATION;
     if (!ts_node_is_null(site)) {
         rc.site_start_byte = ts_node_start_byte(site);
@@ -287,8 +292,14 @@ static void ts_emit_resolved_call_at(TSLSPContext *ctx, const char *callee_qn, c
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
-static void ts_emit_resolved_reference(TSLSPContext *ctx, const char *callee_qn,
-                                       const char *strategy, float confidence, TSNode site) {
+static void ts_emit_resolved_call_at(TSLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                     float confidence, TSNode site) {
+    ts_emit_resolved_call_reason_at(ctx, callee_qn, strategy, confidence, NULL, site);
+}
+
+static void ts_emit_resolved_reference_reason(TSLSPContext *ctx, const char *callee_qn,
+                                              const char *strategy, float confidence,
+                                              const char *reason, TSNode site) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn ||
         ts_node_is_null(site)) {
         return;
@@ -298,11 +309,16 @@ static void ts_emit_resolved_reference(TSLSPContext *ctx, const char *callee_qn,
     rc.callee_qn = callee_qn;
     rc.strategy = strategy ? strategy : "lsp_ts_value_reference";
     rc.confidence = confidence;
-    rc.reason = NULL;
+    rc.reason = reason;
     rc.kind = CBM_RESOLVED_CALL_REFERENCE;
     rc.site_start_byte = ts_node_start_byte(site);
     rc.site_end_byte = ts_node_end_byte(site);
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void ts_emit_resolved_reference(TSLSPContext *ctx, const char *callee_qn,
+                                       const char *strategy, float confidence, TSNode site) {
+    ts_emit_resolved_reference_reason(ctx, callee_qn, strategy, confidence, NULL, site);
 }
 
 static void ts_emit_unresolved_call_at(TSLSPContext *ctx, const char *expr_text, const char *reason,
@@ -1425,6 +1441,19 @@ static bool ts_scope_has_binding(const CBMScope *scope, const char *name) {
     return ts_scope_binding_owner(scope, name) != NULL;
 }
 
+/* The member an import binding names in its module: the exported name of a
+ * renamed named import (`foo` for `import { foo as bar }`, #2297), else the
+ * binding itself. Callers have already matched `local` to an import binding. */
+static const char *ts_import_export_name(const TSLSPContext *ctx, const char *local) {
+    if (!ctx || !local)
+        return local;
+    for (int i = 0; i < ctx->import_alias_count; i++) {
+        if (strcmp(ctx->import_alias_locals[i], local) == 0)
+            return ctx->import_alias_exports[i];
+    }
+    return local;
+}
+
 /* Full QN of an imported symbol. An import value is normally the module QN
  * (symbol = module + "." + name), but may already be the symbol QN. When the
  * module QN ends in ".name" the spelling is ambiguous: `Foo.ts` exporting
@@ -1463,14 +1492,15 @@ static const CBMRegisteredFunc *ts_exact_same_module_function(TSLSPContext *ctx,
 }
 
 /* Return a function only when the local import binding maps to one unambiguous
- * module and that module contains the exact local-name QN. Aliases whose export
- * name is unavailable in CBMImport deliberately fail closed and remain USAGE. */
+ * module and that module contains the exact QN of the member the binding names
+ * (the exported name for `import { foo as bar }`). A renamed import of a name
+ * the module does not export fails closed and remains USAGE. */
 static const CBMRegisteredFunc *ts_exact_imported_function(TSLSPContext *ctx, const char *name) {
     if (!ctx || !ctx->registry || !name || ts_scope_has_binding(ctx->current_scope, name)) {
         return NULL;
     }
     const char *matched_module = NULL;
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
         const char *local = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *module_qn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (!local || !module_qn || strcmp(local, name) != 0) {
@@ -1484,7 +1514,8 @@ static const CBMRegisteredFunc *ts_exact_imported_function(TSLSPContext *ctx, co
     if (!matched_module) {
         return NULL;
     }
-    const char *full_qn = ts_import_symbol_qn(ctx, matched_module, name);
+    const char *full_qn =
+        ts_import_symbol_qn(ctx, matched_module, ts_import_export_name(ctx, name));
     return full_qn ? cbm_registry_lookup_func(ctx->registry, full_qn) : NULL;
 }
 
@@ -1524,7 +1555,7 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
     // and look it up in the registry. If it's a registered func, return its signature;
     // if it's a registered type, return NAMED. Falls back to NAMED(module_qn) for
     // namespace-style imports where no specific symbol matches.
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
         const char *local = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (!local || !mqn || strcmp(local, name) != 0)
@@ -1532,7 +1563,7 @@ static const CBMType *type_of_identifier(TSLSPContext *ctx, const char *name) {
 
         // Construct the full symbol QN using the same convention as exact
         // imported function-value resolution.
-        const char *full_qn = ts_import_symbol_qn(ctx, mqn, name);
+        const char *full_qn = ts_import_symbol_qn(ctx, mqn, ts_import_export_name(ctx, name));
 
         // Try the symbol lookup precedence: registered func, then registered type.
         const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, full_qn);
@@ -2050,14 +2081,14 @@ static const CBMRegisteredFunc *ts_lookup_symbol_for_call(TSLSPContext *ctx, con
 
 /* Map one local import binding to its module.  Duplicate bindings from
  * different modules are ambiguous and deliberately fail closed. */
-static const char *ts_import_module_for_local(const TSLSPContext *ctx, const char *local_name,
+static const char *ts_import_module_for_local(TSLSPContext *ctx, const char *local_name,
                                               bool *out_matched) {
     if (out_matched)
         *out_matched = false;
     if (!ctx || !local_name)
         return NULL;
     const char *matched = NULL;
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = ts_import_first(ctx, local_name); i >= 0; i = ts_import_next(ctx, local_name, i)) {
         const char *local = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *module_qn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (!local || !module_qn || strcmp(local, local_name) != 0)
@@ -2087,7 +2118,8 @@ static const CBMType *ts_new_bare_class_type(TSLSPContext *ctx, const char *cnam
     bool import_matched = false;
     const char *import_module = ts_import_module_for_local(ctx, cname, &import_matched);
     if (import_module)
-        return cbm_type_named(ctx->arena, ts_import_symbol_qn(ctx, import_module, cname));
+        return cbm_type_named(
+            ctx->arena, ts_import_symbol_qn(ctx, import_module, ts_import_export_name(ctx, cname)));
     return cbm_type_named(ctx->arena, local_qn);
 }
 
@@ -2208,7 +2240,8 @@ static const CBMType *ts_signature_for_call(TSLSPContext *ctx, TSNode function, 
             if (!registered) {
                 const char *module_qn = ts_import_module_for_local(ctx, name, NULL);
                 if (module_qn)
-                    registered = ts_lookup_symbol_for_call(ctx, module_qn, name, args);
+                    registered = ts_lookup_symbol_for_call(ctx, module_qn,
+                                                           ts_import_export_name(ctx, name), args);
             }
             if (registered)
                 return registered->signature;
@@ -2559,14 +2592,15 @@ static const CBMType *resolve_type_with_imports(TSLSPContext *ctx, const CBMType
                 return cbm_type_named(ctx->arena, local_qn);
         }
 
-        for (int i = 0; i < ctx->import_count; i++) {
+        for (int i = ts_import_first(ctx, bare); i >= 0; i = ts_import_next(ctx, bare, i)) {
             const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
             const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
             if (!lname || !mqn)
                 continue;
             if (strcmp(lname, bare) != 0)
                 continue;
-            return cbm_type_named(ctx->arena, ts_import_symbol_qn(ctx, mqn, bare));
+            return cbm_type_named(ctx->arena,
+                                  ts_import_symbol_qn(ctx, mqn, ts_import_export_name(ctx, bare)));
         }
         return t;
     }
@@ -2933,12 +2967,19 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
         }
         const CBMRegisteredFunc *target = ts_exact_same_module_function(ctx, name);
         const char *strategy = "lsp_ts_same_module_value_reference";
+        const char *reason = NULL;
         if (!target) {
             target = ts_exact_imported_function(ctx, name);
             strategy = "lsp_ts_import_value_reference";
+            /* `import { foo as bar }`: the site names `bar`, the target is `foo`. */
+            if (target && ts_import_export_name(ctx, name) != name) {
+                strategy = "lsp_callable_value_reference";
+                reason = name;
+            }
         }
         if (target) {
-            ts_emit_resolved_reference(ctx, target->qualified_name, strategy, 0.95f, arg);
+            ts_emit_resolved_reference_reason(ctx, target->qualified_name, strategy, 0.95f, reason,
+                                              arg);
         }
     }
 }
@@ -3021,18 +3062,24 @@ static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
             }
         }
         // Imported default/named function.
-        for (int i = 0; i < ctx->import_count; i++) {
+        for (int i = ts_import_first(ctx, name); i >= 0; i = ts_import_next(ctx, name, i)) {
             const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
             const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
             if (lname && mqn && strcmp(lname, name) == 0) {
-                const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, mqn, name, args);
+                const char *member = ts_import_export_name(ctx, name);
+                const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, mqn, member, args);
+                if (f && member != name) {
+                    ts_emit_resolved_call_reason_at(ctx, f->qualified_name, "lsp_import_alias",
+                                                    0.95f, name, call_node);
+                    return;
+                }
                 if (f) {
                     ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_import", 0.95f,
                                              call_node);
                     return;
                 }
                 // Fall through to qualified_name fallback.
-                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, name);
+                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, member);
                 ts_emit_unresolved_call_at(ctx, qn, "import_symbol_not_in_registry", call_node);
                 return;
             }
@@ -3353,7 +3400,7 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
         }
     }
     // Try imports.
-    for (int i = 0; i < ctx->import_count; i++) {
+    for (int i = ts_import_first(ctx, tag_name); i >= 0; i = ts_import_next(ctx, tag_name, i)) {
         const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (lname && mqn && strcmp(lname, tag_name) == 0) {
@@ -3374,7 +3421,13 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
              * per-file row deliberately keeps the file eligible for the
              * cross-file pass, where resolved import QNs and project defs are
              * available. */
-            const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, mqn, tag_name);
+            const char *member = ts_import_export_name(ctx, tag_name);
+            const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, mqn, member);
+            if (f && member != tag_name) {
+                ts_emit_resolved_call_reason_at(ctx, f->qualified_name, "lsp_import_alias", 0.95f,
+                                                tag_name, tag);
+                return;
+            }
             if (f) {
                 ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_jsx_import", 0.95f, tag);
                 return;
@@ -3984,25 +4037,95 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->debug = (debug_env && debug_env[0]);
 }
 
+enum { TS_IMPORT_FIRST_CAPACITY = 8, TS_SCRATCH_ARENA_BLOCK = 4096 };
+
 void ts_lsp_add_import(TSLSPContext *ctx, const char *local_name, const char *module_qn) {
     if (!ctx || !ctx->arena || !local_name || !module_qn)
         return;
-    int new_count = ctx->import_count + 1;
-    const char **names =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)new_count * sizeof(const char *));
-    const char **qns =
-        (const char **)cbm_arena_alloc(ctx->arena, (size_t)new_count * sizeof(const char *));
-    if (!names || !qns)
-        return;
-    for (int i = 0; i < ctx->import_count; i++) {
-        names[i] = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
-        qns[i] = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
+    /* The arrays double when full: copied on every import, a file of thousands of
+     * imports was quadratic. */
+    if (ctx->import_count == ctx->import_capacity) {
+        int capacity = ctx->import_capacity ? ctx->import_capacity * 2 : TS_IMPORT_FIRST_CAPACITY;
+        const char **names =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(const char *));
+        const char **qns =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)capacity * sizeof(const char *));
+        if (!names || !qns)
+            return;
+        for (int i = 0; i < ctx->import_count; i++) {
+            CBM_LSP_WORK(1);
+            names[i] = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
+            qns[i] = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
+        }
+        ctx->import_local_names = names;
+        ctx->import_module_qns = qns;
+        ctx->import_capacity = capacity;
     }
-    names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
-    qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
-    ctx->import_local_names = names;
-    ctx->import_module_qns = qns;
-    ctx->import_count = new_count;
+    ctx->import_local_names[ctx->import_count] = cbm_arena_strdup(ctx->arena, local_name);
+    ctx->import_module_qns[ctx->import_count] = cbm_arena_strdup(ctx->arena, module_qn);
+    ctx->import_count++;
+}
+
+static void ts_lsp_add_import_alias(TSLSPContext *ctx, const char *local, const char *exported) {
+    if ((size_t)ctx->import_alias_count == ctx->import_alias_capacity) {
+        /* The arena retains old arrays: grow geometrically so collecting A
+         * aliases retains O(A) pointers instead of O(A squared). */
+        size_t capacity = ctx->import_alias_capacity ? ctx->import_alias_capacity * 2 : 8;
+        const char **locals =
+            (const char **)cbm_arena_alloc(ctx->arena, capacity * sizeof(const char *));
+        const char **exports =
+            (const char **)cbm_arena_alloc(ctx->arena, capacity * sizeof(const char *));
+        if (!locals || !exports)
+            return;
+        for (int i = 0; i < ctx->import_alias_count; i++) {
+            locals[i] = ctx->import_alias_locals[i];
+            exports[i] = ctx->import_alias_exports[i];
+        }
+        ctx->import_alias_locals = locals;
+        ctx->import_alias_exports = exports;
+        ctx->import_alias_capacity = capacity;
+    }
+    ctx->import_alias_locals[ctx->import_alias_count] = local;
+    ctx->import_alias_exports[ctx->import_alias_count] = exported;
+    ctx->import_alias_count++;
+}
+
+/* Record each `import { foo as bar }` binding of the file (#2297). The import
+ * map holds only local bindings, so a renamed binding spelled `<module>.bar`,
+ * named nothing, and every call through it lost its CALLS edge. Reading the
+ * file's own import statements serves the per-file and both cross-file entry
+ * points alike. `default as x` keeps today's local-name lookup (a default
+ * import binds no exported member name); string export names and identity
+ * aliases need no entry. Must run before the type passes, which resolve
+ * imported type names. */
+static void ts_lsp_collect_import_aliases(TSLSPContext *ctx, TSNode root) {
+    if (!ctx || !ctx->arena || ts_node_is_null(root) || ctx->import_count == 0)
+        return;
+    uint32_t kn = 0;
+    TSNode *kids = collect_children(ctx->arena, root, &kn);
+    for (uint32_t i = 0; i < kn; i++) {
+        if (!node_kind_is(kids[i], "import_statement"))
+            continue;
+        TSNode named = find_first_kind(find_first_kind(kids[i], "import_clause"), "named_imports");
+        if (ts_node_is_null(named))
+            continue;
+        uint32_t sn = 0;
+        TSNode *specs = collect_children(ctx->arena, named, &sn);
+        for (uint32_t j = 0; j < sn; j++) {
+            if (!node_kind_is(specs[j], "import_specifier"))
+                continue;
+            TSNode name = ts_node_child_by_field_name(specs[j], "name", TS_LSP_FIELD_LEN("name"));
+            TSNode alias =
+                ts_node_child_by_field_name(specs[j], "alias", TS_LSP_FIELD_LEN("alias"));
+            if (!node_kind_is(name, "identifier") || !node_kind_is(alias, "identifier"))
+                continue;
+            char *exported = node_text(ctx, name);
+            char *local = node_text(ctx, alias);
+            if (exported && local && strcmp(exported, "default") != 0 &&
+                strcmp(exported, local) != 0)
+                ts_lsp_add_import_alias(ctx, local, exported);
+        }
+    }
 }
 
 // ── Stdlib seeds (Phase 5 will replace with generator) ────────────────────────
@@ -4628,6 +4751,23 @@ void cbm_ts_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena) {
 
 // ── Single-file entry point ───────────────────────────────────────────────────
 
+/* The next function after `row` (-1: the first) whose receiver is `owner`, in
+ * registration order: by name over `receivers` when it could be listed, else by
+ * a scan. */
+static int ts_receiver_row_next(const CBMTypeRegistry *reg, CBMNameRows *rows, CBMArena *arena,
+                                const char **receivers, const char *owner, int row) {
+    if (receivers) {
+        return row < 0 ? cbm_name_rows_first(rows, arena, receivers, reg->func_count, owner)
+                       : cbm_name_rows_next(rows, receivers, reg->func_count, owner, row);
+    }
+    for (int fi = row + 1; fi < reg->func_count; fi++) {
+        CBM_LSP_WORK(1);
+        if (reg->funcs[fi].receiver_type && strcmp(reg->funcs[fi].receiver_type, owner) == 0)
+            return fi;
+    }
+    return -1;
+}
+
 // Build a registry from result->defs: register Class/Interface as types; Function/Method
 // as funcs. Walks AST briefly for class fields/extends.
 static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileResult *result,
@@ -4776,18 +4916,30 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
 
     // Second pass: attach method_names / method_qns to each registered type from
     // the registered methods. Lets dispatch find them via lookup_member_type.
+    // A type's methods are found by receiver name (lsp_name_rows.h): a scan of every
+    // function per type made a file of classes quadratic. The functions do not
+    // change in this pass.
+    CBMArena rows_arena;
+    cbm_arena_init_lazy(&rows_arena, TS_SCRATCH_ARENA_BLOCK);
+    CBMNameRows receiver_rows = {0};
+    const char **receivers = reg->func_count > 0
+                                 ? (const char **)cbm_arena_alloc(
+                                       &rows_arena, (size_t)reg->func_count * sizeof(*receivers))
+                                 : NULL;
+    for (int fi = 0; receivers && fi < reg->func_count; fi++)
+        receivers[fi] = reg->funcs[fi].receiver_type;
     for (int ti = 0; ti < reg->type_count; ti++) {
         CBMRegisteredType *rt = &reg->types[ti];
         if (!rt->qualified_name)
             continue;
+        const char *owner = rt->qualified_name;
 
         // Count methods first.
         int mcount = 0;
-        for (int fi = 0; fi < reg->func_count; fi++) {
-            const CBMRegisteredFunc *f = &reg->funcs[fi];
-            if (f->receiver_type && strcmp(f->receiver_type, rt->qualified_name) == 0) {
-                mcount++;
-            }
+        for (int fi = ts_receiver_row_next(reg, &receiver_rows, &rows_arena, receivers, owner, -1);
+             fi >= 0;
+             fi = ts_receiver_row_next(reg, &receiver_rows, &rows_arena, receivers, owner, fi)) {
+            mcount++;
         }
         if (mcount == 0)
             continue;
@@ -4799,19 +4951,20 @@ static void register_file_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMFileRes
         if (!mnames || !mqns)
             continue;
         int idx = 0;
-        for (int fi = 0; fi < reg->func_count && idx < mcount; fi++) {
+        for (int fi = ts_receiver_row_next(reg, &receiver_rows, &rows_arena, receivers, owner, -1);
+             fi >= 0 && idx < mcount;
+             fi = ts_receiver_row_next(reg, &receiver_rows, &rows_arena, receivers, owner, fi)) {
             const CBMRegisteredFunc *f = &reg->funcs[fi];
-            if (f->receiver_type && strcmp(f->receiver_type, rt->qualified_name) == 0) {
-                mnames[idx] = f->short_name;
-                mqns[idx] = f->qualified_name;
-                idx++;
-            }
+            mnames[idx] = f->short_name;
+            mqns[idx] = f->qualified_name;
+            idx++;
         }
         mnames[mcount] = NULL;
         mqns[mcount] = NULL;
         rt->method_names = mnames;
         rt->method_qns = mqns;
     }
+    cbm_arena_destroy(&rows_arena);
 }
 
 // AST walk stacks for the passes below. The first chunk lives on the C stack, the
@@ -5452,7 +5605,9 @@ static void apply_jsdoc_signatures(TSLSPContext *ctx, TSNode root, CBMTypeRegist
             continue;
         const char *fqn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, fname);
 
-        for (int fi = 0; fi < reg->func_count; fi++) {
+        /* The loop patches the first registration of fqn; start there. */
+        const CBMRegisteredFunc *own = cbm_registry_first_own_func(reg, fqn);
+        for (int fi = own ? (int)(own - reg->funcs) : reg->func_count; fi < reg->func_count; fi++) {
             if (!reg->funcs[fi].qualified_name)
                 continue;
             if (strcmp(reg->funcs[fi].qualified_name, fqn) != 0)
@@ -5553,15 +5708,10 @@ static void infer_implicit_returns(TSLSPContext *ctx, TSNode root, CBMTypeRegist
         const CBMType *rets[2] = {inferred, NULL};
         const CBMType *new_sig = cbm_type_func(ctx->arena, param_names, param_types, rets);
 
-        // Patch the registered func in place.
-        for (int fi = 0; fi < reg->func_count; fi++) {
-            if (reg->funcs[fi].qualified_name == fqn ||
-                (reg->funcs[fi].qualified_name &&
-                 strcmp(reg->funcs[fi].qualified_name, fqn) == 0)) {
-                reg->funcs[fi].signature = new_sig;
-                break;
-            }
-        }
+        // Patch the registered func in place: its first registration.
+        CBMRegisteredFunc *patched = cbm_registry_first_own_func(reg, fqn);
+        if (patched)
+            patched->signature = new_sig;
     }
 }
 
@@ -5759,17 +5909,10 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
                 }
             }
             // Find or insert.
-            bool found = false;
-            for (int ti = 0; ti < reg->type_count; ti++) {
-                if (reg->types[ti].qualified_name &&
-                    strcmp(reg->types[ti].qualified_name, qn) == 0) {
-                    if (alias_qn)
-                        reg->types[ti].alias_of = alias_qn;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
+            CBMRegisteredType *known = cbm_registry_first_own_type(reg, qn);
+            if (known && alias_qn)
+                known->alias_of = alias_qn;
+            if (!known) {
                 CBMRegisteredType rt;
                 memset(&rt, 0, sizeof(rt));
                 rt.qualified_name = qn;
@@ -5794,14 +5937,7 @@ static void ast_sweep_shapes(TSLSPContext *ctx, TSNode root, CBMTypeRegistry *re
         const char *class_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
 
         // Find the registered type and augment with fields.
-        CBMRegisteredType *rt = NULL;
-        for (int ti = 0; ti < reg->type_count; ti++) {
-            if (reg->types[ti].qualified_name &&
-                strcmp(reg->types[ti].qualified_name, class_qn) == 0) {
-                rt = &reg->types[ti];
-                break;
-            }
-        }
+        CBMRegisteredType *rt = cbm_registry_first_own_type(reg, class_qn);
         if (!rt)
             continue;
 
@@ -5932,7 +6068,16 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
     cbm_ts_stdlib_register(&reg, arena);
+    /* The passes below ask about every definition of the file, while it fills and
+     * after. It is indexed once its defs are in, with the first registration
+     * answering as a scan does, and what the passes add after that is found by
+     * name behind the index. The index memory is scratch: nothing reads it later. */
+    reg.index_first_registered = true;
+    CBMArena idx_arena;
+    cbm_arena_init_lazy(&idx_arena, TS_SCRATCH_ARENA_BLOCK);
+    reg.tail_arena = &idx_arena;
     register_file_defs(arena, &reg, result, result->module_qn);
+    cbm_registry_finalize_into(&reg, &idx_arena);
 
     TSLSPContext ctx;
     ts_lsp_init(&ctx, arena, source, source_len, &reg, result->module_qn, js_mode, jsx_mode,
@@ -5948,6 +6093,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             ts_lsp_add_import(&ctx, imp->local_name, imp->module_path);
         }
     }
+    ts_lsp_collect_import_aliases(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
     refine_ast_signatures(&ctx, root, &reg);
@@ -5955,6 +6101,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     infer_implicit_returns(&ctx, root, &reg);
 
     ts_lsp_process_file(&ctx, root);
+    cbm_arena_destroy(&idx_arena);
 }
 
 // ── Cross-file entry point (Phase 3) ──────────────────────────────────────────
@@ -6201,6 +6348,7 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
             ts_lsp_add_import(&ctx, import_names[i], import_qns[i]);
         }
     }
+    ts_lsp_collect_import_aliases(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &overlay);
     refine_ast_signatures(&ctx, root, &overlay);
@@ -6416,6 +6564,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             ts_lsp_add_import(&ctx, import_names[i], import_qns[i]);
         }
     }
+    ts_lsp_collect_import_aliases(&ctx, root);
 
     ast_sweep_shapes(&ctx, root, &reg);
     refine_ast_signatures(&ctx, root, &reg);
