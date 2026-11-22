@@ -1960,10 +1960,19 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     /* Namespace/package → File-QN map for namespace imports (C# `using`,
      * Java/Kotlin `import`, PHP `use`). Built from the full result cache so
      * every declaring file is visible regardless of loop order. */
-    const char **rels = (const char **)calloc((size_t)file_count, sizeof(char *));
+    /* An incremental run also passes the stored namespaces of the files it
+     * does not re-parse (ctx->ns_base_*), appended after the re-parsed ones. */
+    const int ns_base = (ctx->ns_base_rels && ctx->ns_base_names && ctx->ns_base_count > 0)
+                            ? ctx->ns_base_count
+                            : 0;
+    const int ns_total = file_count + ns_base;
+    const char **rels = (const char **)calloc((size_t)(ns_total ? ns_total : 1), sizeof(char *));
     if (rels) {
         for (int i = 0; i < file_count; i++) {
             rels[i] = files[i].rel_path;
+        }
+        for (int i = 0; i < ns_base; i++) {
+            rels[file_count + i] = ctx->ns_base_rels[i];
         }
     }
     /* Built from every file, including the ones already parked on disk: their
@@ -1972,15 +1981,21 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * therefore used to CHANGE the graph rather than merely delay it -- php
      * measured 57,182 edges in memory against 59,379 while spilling, the same
      * binary and corpus (2026-09-18), differing in both directions. */
-    const char **namespaces = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(char *));
+    const char **namespaces =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)(ns_total ? ns_total : 1) * sizeof(char *));
     CBMHashTable *namespace_map = NULL;
-    if (namespaces) {
+    if (namespaces && rels) {
         for (int i = 0; i < file_count; i++) {
             namespaces[i] = result_cache[i] ? result_cache[i]->namespace_name
                                             : cbm_result_spill_namespace(ctx->spill, i);
         }
+        for (int i = 0; i < ns_base; i++) {
+            namespaces[file_count + i] = ctx->ns_base_names[i];
+        }
         namespace_map =
-            cbm_pipeline_namespace_map_build_names(ctx->project_name, namespaces, rels, file_count);
+            cbm_pipeline_namespace_map_build_names(ctx->project_name, namespaces, rels, ns_total);
+    }
+    if (namespaces) {
         cbm_free(CBM_MEM_CLASS_OTHER, namespaces);
     }
     free(rels);

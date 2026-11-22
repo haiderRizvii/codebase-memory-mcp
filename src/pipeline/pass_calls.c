@@ -149,7 +149,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                 continue;
             }
             const cbm_gbuf_node_t *target =
-                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
+                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, cbm_pipeline_get_nsmap());
             if (!target) {
                 continue;
             }

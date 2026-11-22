@@ -2466,6 +2466,8 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
             }
             memmove(dd, dd + 1, strlen(dd + 1) + 1);
         }
+        char member[256] = {0};
+        bool member_set = false;
         for (;;) {
             /* The map value is a '\n'-delimited list of __file__ QNs declaring
              * this namespace. Return the FIRST that is not the importing file,
@@ -2474,6 +2476,37 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
              * deterministically, independent of file-iteration order across
              * platforms (amd64 vs arm64). */
             const char *list = (const char *)cbm_ht_get(namespace_map, norm);
+            /* `import pkg.Type` names a type, not the package: when the lookup
+             * dropped a member segment, prefer the package file named after it
+             * (Type.java / Type.kt) over the first file of the package. */
+            if (list && member[0]) {
+                size_t ml = strlen(member);
+                static const char sfx[] = ".__file__";
+                const size_t sl = sizeof(sfx) - 1;
+                for (const char *seg = list; seg && *seg;) {
+                    const char *eol = strchr(seg, '\n');
+                    size_t len = eol ? (size_t)(eol - seg) : strlen(seg);
+                    if (len > sl + ml + 2 && memcmp(seg + len - sl, sfx, sl) == 0) {
+                        size_t ext = len - sl; /* index just past the stem's extension */
+                        while (ext > 0 && seg[ext - 1] != '.') {
+                            ext--;
+                        }
+                        /* seg[ext-1] is the '.' before the extension */
+                        if (ext >= ml + 2 && memcmp(seg + ext - 1 - ml, member, ml) == 0 &&
+                            seg[ext - 2 - ml] == '.' && len < 1024) {
+                            char qbuf[1024];
+                            memcpy(qbuf, seg, len);
+                            qbuf[len] = '\0';
+                            const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
+                            if (n && (!php_only || node_in_php_file(n)) &&
+                                (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+                                return n;
+                            }
+                        }
+                    }
+                    seg = eol ? eol + 1 : NULL;
+                }
+            }
             for (const char *seg = list; seg && *seg;) {
                 const char *eol = strchr(seg, '\n');
                 size_t len = eol ? (size_t)(eol - seg) : strlen(seg);
@@ -2492,6 +2525,13 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
             char *dot = strrchr(norm, '.');
             if (!dot) {
                 break;
+            }
+            /* Remember only the first dropped segment (the imported type). */
+            if (!member_set) {
+                snprintf(member, sizeof(member), "%s", dot + 1);
+                member_set = true;
+            } else {
+                member[0] = '\0';
             }
             *dot = '\0';
         }
